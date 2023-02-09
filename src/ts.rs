@@ -1,25 +1,21 @@
 extern crate tree_sitter;
 extern crate tree_sitter_commonlisp;
 
+use std::{rc::{
+    Weak,
+    Rc,
+}, any::Any};
+
 use tree_sitter::{
     Parser, 
     Language,
-    Node,
     Tree,
-    TreeCursor,
 };
 
 pub struct Frontend {
     parser: Parser,
     language: Language,
-    tree: Option<Tree>,
-}
-
-impl Default for Frontend {
-    fn default() -> Self {
-        Frontend::from_language(tree_sitter_commonlisp::language())
-            .unwrap()
-    }
+    tree: Option<Rc<Tree>>,
 }
 
 impl Frontend {
@@ -36,8 +32,13 @@ impl Frontend {
     }
 
     pub fn parse(&mut self, code: &str) {
-        if let Some(new_tree) = self.parser.parse(code, self.tree.as_ref()) {
-            self.tree = Some(new_tree);
+        let new_tree = if let Some(old_tree) = &self.tree {
+            self.parser.parse(code, Some(old_tree.as_ref()))
+        } else {
+            self.parser.parse(code, None)
+        };
+        if let Some(tree) = new_tree {
+            self.tree = Some(Rc::new(tree));
         } else {
             self.tree = None;
         }
@@ -45,40 +46,47 @@ impl Frontend {
         self.walk_parsed().iter().for_each(|sexp| println!("{}", sexp));
     }
     
-    pub fn walk_parsed(&mut self) -> Vec<String> {
-        if let Some(tree) = &mut self.tree {
+    pub fn walk_parsed(&self) -> Vec<String> {
+
+        if let Some(tree) = &self.tree {
             let mut cursor = tree.walk();
-            let mut nodes = Vec::new();
-            let mut break_outer = false;
-            
+            let mut nodes = vec![];
+
             loop {
+                // goto leaf
+                if cursor.goto_first_child() {
+                    continue;
+                }
+                
                 let node = cursor.node();
 
-                if cursor.goto_first_child() || cursor.goto_next_sibling() {
+                if cursor.goto_next_sibling() {
+                    println!("sibling");
                     nodes.push(node);
-                }
-
-                if break_outer {
-                    break;
+                    continue;
                 }
 
                 loop {
+                    println!("inner loop");
+                    nodes.push(cursor.node());
+
                     if !cursor.goto_parent() {
-                        break_outer = true;
-                        break;
+                        // back at root, done
+                        return nodes.iter().map(|n| format!("{}, {}, {}", n.id(), n.kind(), n.to_sexp())).collect();
                     }
 
+                    let node = cursor.node();
+                    
                     if cursor.goto_next_sibling() {
+                        println!("inner sibling");
+                        nodes.push(node);
                         break;
                     }
                 }
-
-                nodes.push(node);
             }
-
-            nodes.iter().map(|n| n.to_sexp()).collect()
-        } else {
-            vec![]
+        }
+        else {
+            return vec![]
         }
     }
 }

@@ -16,7 +16,7 @@ unsafe fn run_ptr<I, O>(ptr: *const u8, input: I) -> O {
 }
 
 fn main() {
-    let mut frontend = Frontend::default();
+    let mut frontend = Frontend::from_language(tree_sitter_commonlisp::language()).unwrap();
     frontend.parse("()");
 
     /*
