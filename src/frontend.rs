@@ -1,10 +1,13 @@
-extern crate tree_sitter;
-extern crate tree_sitter_commonlisp;
+mod parse_grammar;
+mod rules;
+mod grammars;
+mod nfa;
 
 use std::{
     rc::Rc, 
     collections::{
         HashMap,
+        HashSet,
     },
 };
 
@@ -16,6 +19,8 @@ use tree_sitter::{
     QueryError,
     Node,
 };
+
+use grammars::InputGrammar;
 
 pub struct Frontend {
     parser: Parser,
@@ -135,6 +140,35 @@ impl Frontend {
         }
         else {
             return vec![]
+        }
+    }
+
+    pub fn get_kinds(&self) -> HashSet::<String> {
+        let mut kinds = HashSet::<String>::new();
+
+        for id in 0..self.language.node_kind_count() {
+            if !self.language.node_kind_is_named(id as u16) 
+            || !self.language.node_kind_is_visible(id as u16) {
+                continue;
+            }
+
+            if let Some(kind) = self.language.node_kind_for_id(id as u16) {
+                kinds.insert(kind.to_string());
+                continue;
+            }
+        }
+
+        kinds
+    }
+
+    pub fn get_rules(&self, grammar: &str) -> Result<InputGrammar, String> {
+        match parse_grammar::parse_grammar(grammar) {
+            Err(err) => Err(err.to_string()),
+            Ok(grammar) => {
+
+                Ok(grammar)
+            },
+
         }
     }
 

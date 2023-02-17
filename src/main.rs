@@ -4,11 +4,9 @@ extern crate cranelift_jit;
 
 use std::io::Read;
 use std::mem;
-use std::env;
-use std::collections::HashSet;
 
-mod ts;
-use ts::*;
+mod frontend;
+use frontend::*;
 
 mod jit;
 use jit::*;
@@ -18,12 +16,20 @@ unsafe fn run_ptr<I, O>(ptr: *const u8, input: I) -> O {
     code_fn(input)
 }
 
+// TODO: Obviously load this from somewhere...
+const LISP_GRAMMAR: &str = include_str!("/home/simon/.cargo/registry/src/github.com-1ecc6299db9ec823/tree-sitter-commonlisp-0.3.0/src/grammar.json");
+
 fn main() {
     let mut jit = JIT::default();
-    let mut frontend = Frontend::from_language(tree_sitter_commonlisp::language()).unwrap();
+    let mut fe = Frontend::from_language(tree_sitter_commonlisp::language()).unwrap();
 
     let mut stdin = std::io::stdin();
     let mut buffer = String::new();
+
+    fe.get_kinds();
+    if let Ok(grammar) = fe.get_rules(LISP_GRAMMAR) {
+        println!("Grammar: {:#?}", grammar);
+    }
 
     loop {
         let mut chunk: [u8; 1024] = [0; 1024];
@@ -32,9 +38,9 @@ fn main() {
             Ok(len) => {
                 let utf8_chunk = String::from_utf8(chunk[0..len].to_vec()).unwrap();
                 buffer.push_str(&utf8_chunk);
-                frontend.parse(&buffer);
+                fe.parse(&buffer);
 
-                let matches = frontend.query("
+                let matches = fe.query("
 (list_lit . (sym_lit) @function.builtin (#cl-standard-function? @function.builtin))
 (list_lit . (sym_lit) @function.macro (#cl-standard-macro? @function.macro))
 ").unwrap();
@@ -64,7 +70,7 @@ fn main() {
             },
             Err(error) => panic!("{:?}", error),
         }
-        frontend.reset();
+        fe.reset();
         buffer.clear();
     }
 
