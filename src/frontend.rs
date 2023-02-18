@@ -1,7 +1,10 @@
 mod parse_grammar;
 mod rules;
 mod grammars;
+mod frontend_language;
 mod nfa;
+
+pub use frontend_language::FrontendLanguage;
 
 use std::{
     rc::Rc, 
@@ -20,17 +23,23 @@ use tree_sitter::{
     Node,
 };
 
-use grammars::InputGrammar;
+use grammars::Variable;
+
+use self::rules::Rule;
 
 pub struct Frontend {
     parser: Parser,
     language: Language,
+    grammar: HashMap<String, Variable>,
     tree: Option<Rc<Tree>>,
     buffer: String,
 }
 
 impl Frontend {
-    pub fn from_language(language: Language) -> Result<Self, String> {
+    pub fn from_language(language: FrontendLanguage) -> Result<Self, String> {
+        let grammar = language.ts_grammar();
+        let language = language.ts_language();
+
         let mut parser = Parser::new();
         parser.set_language(language)
             .map_err(|e| e.to_string())?;
@@ -38,8 +47,9 @@ impl Frontend {
         Ok(Self {
             parser,
             language,
-            tree: None,
+            grammar,
             buffer: String::with_capacity(0),
+            tree: None,
         })
     }
 
@@ -79,8 +89,6 @@ impl Frontend {
             let pat_idx = pat_idx.unwrap() as usize;
 
             let start_byte = patterns.start_byte_for_pattern(pat_idx);
-            let settings = patterns.property_settings(pat_idx);
-            println!("settings for {}: {:?}", &cap_names[i], settings);
 
             if ret_map.contains_key(&cap_names[i]) {
                 ret_map.get_mut(&cap_names[i]).unwrap().push(start_byte);
@@ -98,9 +106,40 @@ impl Frontend {
         self.buffer = String::with_capacity(0);
     }
 
-    fn print_node(&self, n: &Node) -> String {
+    fn process_node(&self, n: &Node) -> String {
         let node_text = &self.buffer[n.start_byte()..n.end_byte()];
-        format!("{}, [{}, {}] = {}, \"{}\"", n.kind(), n.start_position(), n.end_position(), n.to_sexp(), node_text)
+
+        if n.is_error() {
+            format!("{} Error", node_text)
+        }
+        else if n.is_extra() {
+            format!("{} Extra", node_text)
+        }
+        else if n.is_missing() {
+            format!("{} Missing", node_text)
+        }
+        else if !n.is_named() {
+            format!("{} Unnamed", node_text)
+        }
+        else if let Some(variable) = self.grammar.get(n.kind()) {
+            let rule = match &variable.rule {
+                Rule::String(s) => s.clone(),
+                Rule::Blank => "Blank".to_string(),
+                Rule::Seq(s) => format!("{:?}", s),
+                Rule::Symbol(s) => format!("{:?}", s),
+                Rule::Choice(c) => format!("{:?}", c),
+                Rule::Repeat(c) => format!("{:?}", c),
+                Rule::Pattern(p) => format!("{:?}", p),
+                Rule::NamedSymbol(ns) => format!("{:?}", ns),
+                Rule::Metadata { params, rule } => format!("@ {:?} = {:?}", params, rule),
+            };
+
+            format!("{} [{}]", node_text, rule)
+        }
+        else {
+            format!("{} Unknown: {}", node_text, n.kind())
+        }
+        //println!("{}, [{}, {}] = {}, \"{}\"", n.kind(), n.start_position(), n.end_position(), n.to_sexp(), node_text);
     }
 
     fn walk_parsed(&self) -> Vec<String> {
@@ -126,7 +165,7 @@ impl Frontend {
 
                     if !cursor.goto_parent() {
                         // back at root, done
-                        return nodes.iter().map(|n| self.print_node(n)).collect();
+                        return nodes.iter().map(|n| self.process_node(n)).collect();
                     }
 
                     let node = cursor.node();
@@ -142,34 +181,4 @@ impl Frontend {
             return vec![]
         }
     }
-
-    pub fn get_kinds(&self) -> HashSet::<String> {
-        let mut kinds = HashSet::<String>::new();
-
-        for id in 0..self.language.node_kind_count() {
-            if !self.language.node_kind_is_named(id as u16) 
-            || !self.language.node_kind_is_visible(id as u16) {
-                continue;
-            }
-
-            if let Some(kind) = self.language.node_kind_for_id(id as u16) {
-                kinds.insert(kind.to_string());
-                continue;
-            }
-        }
-
-        kinds
-    }
-
-    pub fn get_rules(&self, grammar: &str) -> Result<InputGrammar, String> {
-        match parse_grammar::parse_grammar(grammar) {
-            Err(err) => Err(err.to_string()),
-            Ok(grammar) => {
-
-                Ok(grammar)
-            },
-
-        }
-    }
-
 }
