@@ -1,11 +1,8 @@
-extern crate cranelift;
-extern crate cranelift_module;
-extern crate cranelift_jit;
+mod frontend;
 
 use std::io::Read;
 use std::mem;
 
-mod frontend;
 use frontend::*;
 
 mod jit;
@@ -18,7 +15,7 @@ unsafe fn run_ptr<I, O>(ptr: *const u8, input: I) -> O {
 
 fn main() {
     let mut jit = JIT::default();
-    let mut fe = Frontend::from_language(FrontendLanguage::CommonLisp)
+    let mut fe = Frontend::from_language(tree_sitter_commonlisp::language())
         .expect("Unable to initialize frontend");
 
     let mut stdin = std::io::stdin();

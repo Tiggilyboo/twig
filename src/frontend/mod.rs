@@ -1,10 +1,5 @@
-mod parse_grammar;
-mod rules;
-mod grammars;
-mod frontend_language;
-mod nfa;
-
-pub use frontend_language::FrontendLanguage;
+mod types;
+mod operator;
 
 use std::{
     rc::Rc, 
@@ -23,23 +18,15 @@ use tree_sitter::{
     Node,
 };
 
-use grammars::Variable;
-
-use self::rules::Rule;
-
 pub struct Frontend {
     parser: Parser,
     language: Language,
-    grammar: HashMap<String, Variable>,
     tree: Option<Rc<Tree>>,
     buffer: String,
 }
 
 impl Frontend {
-    pub fn from_language(language: FrontendLanguage) -> Result<Self, String> {
-        let grammar = language.ts_grammar();
-        let language = language.ts_language();
-
+    pub fn from_language(language: Language) -> Result<Self, String> {
         let mut parser = Parser::new();
         parser.set_language(language)
             .map_err(|e| e.to_string())?;
@@ -47,7 +34,6 @@ impl Frontend {
         Ok(Self {
             parser,
             language,
-            grammar,
             buffer: String::with_capacity(0),
             tree: None,
         })
@@ -106,50 +92,23 @@ impl Frontend {
         self.buffer = String::with_capacity(0);
     }
 
-    fn process_node(&self, n: &Node) -> String {
+    fn process_node(&self, n: &Node, depth: usize) -> String {
         let node_text = &self.buffer[n.start_byte()..n.end_byte()];
+        let indent: String = "  ".repeat(depth);
 
-        if n.is_error() {
-            format!("{} Error", node_text)
-        }
-        else if n.is_extra() {
-            format!("{} Extra", node_text)
-        }
-        else if n.is_missing() {
-            format!("{} Missing", node_text)
-        }
-        else if !n.is_named() {
-            format!("{} Unnamed", node_text)
-        }
-        else if let Some(variable) = self.grammar.get(n.kind()) {
-            let rule = match &variable.rule {
-                Rule::String(s) => s.clone(),
-                Rule::Blank => "Blank".to_string(),
-                Rule::Seq(s) => format!("{:?}", s),
-                Rule::Symbol(s) => format!("{:?}", s),
-                Rule::Choice(c) => format!("{:?}", c),
-                Rule::Repeat(c) => format!("{:?}", c),
-                Rule::Pattern(p) => format!("{:?}", p),
-                Rule::NamedSymbol(ns) => format!("{:?}", ns),
-                Rule::Metadata { params, rule } => format!("@ {:?} = {:?}", params, rule),
-            };
-
-            format!("{} [{}]", node_text, rule)
-        }
-        else {
-            format!("{} Unknown: {}", node_text, n.kind())
-        }
-        //println!("{}, [{}, {}] = {}, \"{}\"", n.kind(), n.start_position(), n.end_position(), n.to_sexp(), node_text);
+        format!("{}{} = {}", indent, n.to_sexp(), node_text)
     }
 
     fn walk_parsed(&self) -> Vec<String> {
         if let Some(tree) = &self.tree {
             let mut cursor = tree.walk();
             let mut nodes = vec![];
+            let mut depth = 0;
 
             loop {
                 // goto leaf
                 if cursor.goto_first_child() {
+                    depth += 1;
                     continue;
                 }
                 
@@ -165,8 +124,9 @@ impl Frontend {
 
                     if !cursor.goto_parent() {
                         // back at root, done
-                        return nodes.iter().map(|n| self.process_node(n)).collect();
+                        return nodes.iter().map(|n| self.process_node(n, depth)).collect();
                     }
+                    depth -= 1;
 
                     let node = cursor.node();
                     
