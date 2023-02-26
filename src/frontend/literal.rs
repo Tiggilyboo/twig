@@ -17,7 +17,7 @@ pub enum Literal {
     Number(Type, Vec<u8>),
     Comment(String),
     String(String),
-    Identifier(String),
+    Identifier(String, Option<Type>),
 }
 
 impl FrontendGrammar<Literal> for CommonLispGrammar<Literal> {
@@ -35,11 +35,11 @@ impl FrontendGrammar<Literal> for CommonLispGrammar<Literal> {
                 } else if let Ok(cmp) = Comparator::try_from(node_text) {
                     Some(Literal::Symbol(Symbol::Comparator(cmp)))
                 } else {
-                    Some(Literal::Identifier(node_text.to_string()))
+                    Some(Literal::Identifier(node_text.to_string(), None))
                 }
             },
             "kwd_symbol" => {
-                Some(Literal::Identifier(node_text.to_string()))
+                Some(Literal::Identifier(node_text.to_string(), None))
             }
             "num_lit" => {
                 if let Ok(num_int) = node_text.parse::<i32>() {
@@ -50,16 +50,12 @@ impl FrontendGrammar<Literal> for CommonLispGrammar<Literal> {
                     None
                 }
             },
-            "comment" => Some(Literal::Comment(node_text.to_string())),
             "char_lit" | "str_lit" => Some(Literal::String(node_text.to_string())),
+            "comment" => Some(Literal::Comment(node_text.to_string())),
             _ => {
                 println!("Unable to parse literal: {} = {}", node_text, n.to_sexp());
                 None
             }
         }
-    }
-
-    fn validate(grammar: Literal) -> Result<(), String> {
-        Ok(())
     }
 }
