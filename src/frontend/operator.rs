@@ -1,7 +1,6 @@
 
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Operator {
-    None,
-
     Add,
     Mul,
     Sub,
@@ -10,28 +9,19 @@ pub enum Operator {
     Exp,
 }
 
-impl Default for Operator {
-    fn default() -> Self {
-        Operator::None
-    }
-}
+impl TryFrom<&str> for Operator {
+    type Error = String;
 
-impl From<&str> for Operator {
-    fn from(s: &str) -> Self {
+    fn try_from(s: &str) -> Result<Self, Self::Error> {
         match s {
-            "+" => Operator::Add,
-            "-" => Operator::Sub,
-            "*" => Operator::Mul,
-            "/" => Operator::Div,
-            "%" => Operator::Mod,
-            "^" => Operator::Exp,
-            _ => Operator::None,
+            "+" => Ok(Operator::Add),
+            "-" => Ok(Operator::Sub),
+            "*" => Ok(Operator::Mul),
+            "/" => Ok(Operator::Div),
+            "%" => Ok(Operator::Mod),
+            "^" => Ok(Operator::Exp),
+            _ => Err(format!("Unsupported operator: {}", s)),
         }
     }
 }
 
-impl PartialEq for Operator {
-    fn eq(&self, other: &Self) -> bool {
-        *self == *other
-    }
-}

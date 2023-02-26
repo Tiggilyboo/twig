@@ -3,6 +3,7 @@ use core::slice;
 use cranelift::prelude::*;
 use cranelift_module::*;
 use cranelift_jit::*;
+use super::frontend::Statement;
 
 pub struct JIT {
     builder_ctx: FunctionBuilderContext,
@@ -43,8 +44,8 @@ impl JIT {
         Ok(buffer_slice)
     }
 
-    pub fn compile(&mut self) -> Result<*const u8, String> {
-        // TODO: parse and convert tree-sitter AST, convert to Cranelift IR...
+    pub fn compile(&mut self, statement: &Statement) -> Result<*const u8, String> {
+        // TODO: validate frontend, annotate with types, and create clir to compile
         
         let name = "main";
         let func_id = self.module.declare_function(name, Linkage::Export, &self.ctx.func.signature)

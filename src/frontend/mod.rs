@@ -1,11 +1,13 @@
-mod types;
+mod frontend_grammar;
 mod operator;
+mod comparator;
+mod literal;
+mod statement;
 
 use std::{
     rc::Rc, 
     collections::{
         HashMap,
-        HashSet,
     },
 };
 
@@ -15,8 +17,14 @@ use tree_sitter::{
     Tree,
     Query,
     QueryError,
-    Node,
 };
+
+use self::frontend_grammar::{
+    FrontendGrammar, 
+    CommonLispGrammar,
+};
+pub use self::statement::*;
+pub use self::literal::*;
 
 pub struct Frontend {
     parser: Parser,
@@ -39,7 +47,7 @@ impl Frontend {
         })
     }
 
-    pub fn parse(&mut self, code: &str) {
+    pub fn parse(&mut self, code: &str) -> Option<Statement> {
         self.buffer = String::from(code);
         let new_tree = if let Some(old_tree) = &self.tree {
             self.parser.parse(code, Some(old_tree.as_ref()))
@@ -52,7 +60,12 @@ impl Frontend {
             self.tree = None;
         }
 
-        self.walk_parsed().iter().for_each(|sexp| println!("{}", sexp));
+        if let Some(tree) = &self.tree {
+            let root_node = tree.root_node();
+            CommonLispGrammar::<Statement>::from_node(&root_node, &self.buffer) 
+        } else {
+            None
+        }
     }
     
     pub fn query(&self, query: &str) -> Result<Query, QueryError> {
@@ -90,55 +103,5 @@ impl Frontend {
         self.tree = None;
         self.parser.reset();
         self.buffer = String::with_capacity(0);
-    }
-
-    fn process_node(&self, n: &Node, depth: usize) -> String {
-        let node_text = &self.buffer[n.start_byte()..n.end_byte()];
-        let indent: String = "  ".repeat(depth);
-
-        format!("{}{} = {}", indent, n.to_sexp(), node_text)
-    }
-
-    fn walk_parsed(&self) -> Vec<String> {
-        if let Some(tree) = &self.tree {
-            let mut cursor = tree.walk();
-            let mut nodes = vec![];
-            let mut depth = 0;
-
-            loop {
-                // goto leaf
-                if cursor.goto_first_child() {
-                    depth += 1;
-                    continue;
-                }
-                
-                let node = cursor.node();
-
-                if cursor.goto_next_sibling() {
-                    nodes.push(node);
-                    continue;
-                }
-
-                loop {
-                    nodes.push(cursor.node());
-
-                    if !cursor.goto_parent() {
-                        // back at root, done
-                        return nodes.iter().map(|n| self.process_node(n, depth)).collect();
-                    }
-                    depth -= 1;
-
-                    let node = cursor.node();
-                    
-                    if cursor.goto_next_sibling() {
-                        nodes.push(node);
-                        break;
-                    }
-                }
-            }
-        }
-        else {
-            return vec![]
-        }
     }
 }

@@ -1,8 +1,7 @@
-mod frontend;
-
 use std::io::Read;
 use std::mem;
 
+mod frontend;
 use frontend::*;
 
 mod jit;
@@ -28,10 +27,14 @@ fn main() {
             Ok(len) => {
                 let utf8_chunk = String::from_utf8(chunk[0..len].to_vec()).unwrap();
                 buffer.push_str(&utf8_chunk);
-                fe.parse(&buffer); 
+                if let Some(parsed_grammar) = fe.parse(&buffer) {
+                    println!("=> {:#?}", parsed_grammar);
+                }
 
                 /*
-                match jit.compile() {
+                println!("Compiling...");
+                
+                match jit.compile(parsed_grammar) {
                     Ok(main_fptr) => {
                         let ret: isize = unsafe {
                             run_ptr(main_fptr, 42)
