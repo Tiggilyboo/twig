@@ -46,9 +46,55 @@ impl Middleware {
         }
     }
 
+    fn try_transform_operation(expression: &Expression) -> Option<Statement> {
+        let mut operator: Option<Operator> = None;
+        let mut operation_args: Option<Expression> = None;
+
+        match expression {
+            Expression::List(expression_children, _) => match expression_children.first() {
+                Some(Expression::Value(Literal::Symbol(Symbol::Operator(op)), _)) => {
+                    operator = Some(op.clone());
+
+                    let mut siblings: Vec<Expression> = expression_children.to_vec();
+                    siblings.pop();
+
+                    if siblings.len() > 1 {
+                        operation_args = Some(Expression::List(siblings, None));
+                    } else {
+                        operation_args = siblings.pop();
+                    }
+                },
+                _ => {
+                    println!("children: {:#?}", expression_children);
+                }
+            },
+            _ => (), 
+        }
+
+        if let Some(operator) = operator {
+            Some(Statement::Operation(operator, operation_args))
+        } else {
+            None
+        }
+    }
+
     fn transform(expression: &Expression) -> Result<Statement, String> {
+        // Recurse child lists (unwrap all ((()))'s)
+        match expression {
+            Expression::List(expression_children, _) => for child in expression_children {
+                if let Ok(statement) = Self::transform(child) {
+                    return Ok(statement);
+                } else {
+                    continue;
+                }
+            },
+            _ => (),
+        }
+
         if let Some(invoke_statement) = Self::try_transform_invoke(expression) {
             Ok(invoke_statement)
+        } else if let Some(operation_statement) = Self::try_transform_operation(expression) {
+            Ok(operation_statement)
         } else {
             Err("Unable to transform expression.".to_string())
         }

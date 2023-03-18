@@ -20,6 +20,6 @@ pub enum Statement {
         truthy: Option<Expression>,
         falsey: Option<Expression>, 
     },
-    Operation(Operator, Vec<Literal>),
+    Operation(Operator, Option<Expression>),
 }
 
