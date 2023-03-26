@@ -1,188 +1,187 @@
-mod statement;
-use statement::*;
-
-use std::collections::HashMap;
+use std::{collections::HashMap, hash::Hash};
 use super::*;
-use cranelift::prelude::types;
 use cranelift::prelude::*;
-use cranelift_module::FunctionDeclaration;
+use cranelift_module::{Linkage, FuncId};
+use log::info;
 
-pub struct Middleware {
-    backend: JIT,
-    builtins: HashMap::<String, FunctionDeclaration>,
+pub struct FunctionTranslator<'a> {
+    pub builder: FunctionBuilder<'a>,
+    pub f_id: FuncId,
+    vars: HashMap<String, Variable>,
+    var_idx: usize,
 }
 
-impl Middleware {
-    fn try_transform_invoke(expression: &Expression) -> Option<Statement> {
-        let mut invoke_identifier: Option<String> = None;
-        let mut invoke_args: Option<Expression> = None;
-
-        match expression {
-            Expression::List(expression_children, _) => match expression_children.first() {
-                Some(Expression::Value(Literal::Identifier(ident, _), _)) => {
-                    invoke_identifier = Some(ident.clone());
-
-                    let mut siblings: Vec<Expression> = expression_children.to_vec();
-                    siblings.pop();
-
-                    if siblings.len() > 1 {
-                        invoke_args = Some(Expression::List(siblings, None));
-                    } else if siblings.len() == 1 {
-                        invoke_args = siblings.pop();
-                    }
-                },
-                _ => (),
-            },
-            _ => (),
-        }
-
-        if let Some(identifier) = invoke_identifier {
-            Some(Statement::Invoke {
-                identifier,
-                args: invoke_args,
-            })
-        } else {
-            None
+impl <'a> FunctionTranslator <'a> {
+    pub fn new(f_id: FuncId, builder: FunctionBuilder<'a>) -> Self {
+        Self {
+            f_id,
+            builder,
+            vars: HashMap::new(),
+            var_idx: 0,
         }
     }
 
-    fn try_transform_operation(expression: &Expression) -> Option<Statement> {
-        let mut operator: Option<Operator> = None;
-        let mut operation_args: Option<Expression> = None;
+    // Validate that all literals are of the same discriminant
+    fn validate_all_same_type<T>(a: &Vec<T>) -> bool {
+        if let Some(first) = a.first() {
+            let first_disc = std::mem::discriminant(first);
+            
+            a.iter().skip(1).all(|l| first_disc == std::mem::discriminant(l))
+        } else {
+            false
+        }
+    }
 
-        match expression {
-            Expression::List(expression_children, _) => match expression_children.first() {
-                Some(Expression::Value(Literal::Symbol(Symbol::Operator(op)), _)) => {
-                    operator = Some(op.clone());
+    fn transform_number(&mut self, n_type: Type, alloc: &Vec<u8>) -> Result<Option<Value>, String> {
+        fn from_alloc_32(a: &Vec<u8>) -> Result<[u8; 4], String> {
+            if a.len() < 4 {
+                return Err(format!("Number allocation did not contain enough bytes for 32bit value: {a:?}"))
+            }
+            Ok([a[0], a[1], a[2], a[3]])
+        }
+        fn from_alloc_64(a: &Vec<u8>) -> Result<[u8; 8], String> {
+            if a.len() < 8 {
+                return Err(format!("Number allocation did not contain enough bytes for 32bit value: {a:?}"))
+            }
+            Ok([a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]])
+        }
+        let var = self.declare_var(n_type, None)?;
+        let val = match n_type {
+            types::I32 => {
+                let num = i32::from_le_bytes(from_alloc_32(alloc)?);
+                self.builder.ins().iconst(n_type, Imm64::new(num as i64))
+            },
+            types::I64 => {
+                let num = i64::from_le_bytes(from_alloc_64(alloc)?);
+                self.builder.ins().iconst(n_type, Imm64::new(num))
+            },
+            types::F32 => {
+                let num = f32::from_le_bytes(from_alloc_32(alloc)?);
+                self.builder.ins().f32const(Ieee32::from(num))
+            },
+            types::F64 => {
+                let num = f64::from_le_bytes(from_alloc_64(alloc)?);
+                self.builder.ins().f64const(Ieee64::from(num))
+            },
+            _ => unimplemented!()
+        };
+        self.builder.def_var(var, val);
+        self.var_idx += 1;
 
-                    let mut siblings: Vec<Expression> = expression_children.to_vec();
-                    siblings.pop();
+        Ok(Some(val))
+    }
 
-                    if siblings.len() > 1 {
-                        operation_args = Some(Expression::List(siblings, None));
-                    } else {
-                        operation_args = siblings.pop();
-                    }
-                },
-                _ => {
-                    println!("children: {:#?}", expression_children);
+    fn transform_literal(&mut self, ret_type: Type, literal: &Literal, siblings: Vec<&Expression>) -> Result<Option<Value>, String> {
+        info!("transform lit: {literal:?} {siblings:?}");
+        match literal {
+            Literal::Comment(_) => Ok(None),
+            Literal::Number(n_type, alloc) => self.transform_number(*n_type, alloc),
+            Literal::Symbol(s) => {
+                let mut args = Vec::new();
+                for sibling in siblings {
+                    args.extend(self.translate(ret_type, sibling, vec![])?);
                 }
+                self.transform_symbol(ret_type, s, args)
             },
-            _ => (), 
-        }
-
-        if let Some(operator) = operator {
-            Some(Statement::Operation(operator, operation_args))
-        } else {
-            None
-        }
-    }
-
-    fn transform(expression: &Expression) -> Result<Statement, String> {
-        // Recurse child lists (unwrap all ((()))'s)
-        match expression {
-            Expression::List(expression_children, _) => for child in expression_children {
-                if let Ok(statement) = Self::transform(child) {
-                    return Ok(statement);
-                } else {
-                    continue;
-                }
-            },
-            _ => (),
-        }
-
-        if let Some(invoke_statement) = Self::try_transform_invoke(expression) {
-            Ok(invoke_statement)
-        } else if let Some(operation_statement) = Self::try_transform_operation(expression) {
-            Ok(operation_statement)
-        } else {
-            Err("Unable to transform expression.".to_string())
-        }
-    }
-
-    fn process(&mut self, statement: &Statement) -> Result<(), String> {
-        // TODO: Manipulate backend to create statement(s)
-        println!("statement: {:#?}", statement);
-
-        match statement {
-            Statement::Invoke { identifier, args, } => match identifier.to_lowercase().as_str() {
-                "write" => {
-                    let mut arg_types = vec![];
-                    let mut num_i32_consts = vec![];
-                    let mut num_f32_consts = vec![];
-
-                    loop {
-                        match args {
-                            Some(Expression::List(args_list, _)) => {
-                            },
-                            Some(Expression::Value(literal, _)) => match literal {
-                                Literal::Number(t, n_bytes) => {
-                                    arg_types.push(*t);
-
-                                    match *t {
-                                        types::I32 => {
-                                            let alloc = [n_bytes[0], n_bytes[1], n_bytes[2], n_bytes[3]];
-                                            num_i32_consts.push((types::I32, i32::from_le_bytes(alloc)));
-                                        },
-                                        types::F32 => {
-                                            let alloc = [n_bytes[0], n_bytes[1], n_bytes[2], n_bytes[3]];
-                                            num_f32_consts.push((types::F32, f32::from_le_bytes(alloc)));
-                                        }
-                                        _ => unimplemented!(),
-                                    }
-                                },
-                                Literal::Identifier(lit_ident, Some(t)) => {
-                                    arg_types.push(*t);
-                                },
-                                Literal::String(s) => {
-                                    unimplemented!()
-                                },
-                                Literal::Comment(_) => continue,
-                                _ => return Err("Expected argument identifier or value".to_string()),
-
-                            },
-                            None => break,
-                        }
-                    }
-                    let (f_id, mut fb) = self.backend.make_function_context(&identifier, arg_types, vec![])?;
-                    {
-                        let block = fb.create_block();
-                        fb.switch_to_block(block);
-
-                        for (t, n) in num_i32_consts {
-                            // TODO: const when i32 @ n?
-                            fb.ins().iconst(t, 0);
-                        }
-                        
-                    }
-                },
-                _ => println!("Undeclared function: {}", identifier),
+            Literal::Identifier(ident, ident_ty) => if self.vars.contains_key(ident) {
+                Ok(Some(self.builder.use_var(*self.vars.get(ident).unwrap())))
+            } else {
+                Err(format!("{ident} ({ident_ty:?}) is not defined"))
             },
             _ => unimplemented!(),
         }
-
-        Ok(())
     }
 
-    pub fn compile(&mut self) -> Result<*const u8, String> {
-        unsafe fn run_ptr<I, O>(ptr: *const u8, input: I) -> O {
-            let code_fn = mem::transmute::<_, fn(I) -> O>(ptr);
-            code_fn(input)
+    fn transform_symbol(&mut self, ret_type: Type, symbol: &Symbol, args: Vec<Value>) -> Result<Option<Value>, String> {
+        match symbol {
+            Symbol::Operator(op) => self.transform_operation(op, ret_type, args),
+            _ => unimplemented!(),
+        }
+    }
+
+    fn transform_operation(&mut self, op: &Operator, arg_type: Type, args: Vec<Value>) -> Result<Option<Value>, String> {
+        let a_len = args.len();
+
+        // TODO vector operations instead of single lane ops
+
+        let mut val_acc = if a_len > 0 {
+            args[0]
+        } else {
+            match arg_type {
+                types::I32 | types::I64 => self.builder.ins().iconst(arg_type, 0),
+                types::F32 => self.builder.ins().f32const(0f32),
+                types::F64 => self.builder.ins().f64const(0f64),
+                _ => unimplemented!(),
+            }
+        };
+
+        for arg in args.iter().skip(1) {
+            match arg_type {
+                types::I32 | types::I64 => match op {
+                    Operator::Add => val_acc = self.builder.ins().iadd(val_acc, arg.clone()),
+                    Operator::Sub => val_acc = self.builder.ins().isub(val_acc, arg.clone()),
+                    Operator::Mul => val_acc = self.builder.ins().imul(val_acc, arg.clone()),
+                    Operator::Div => val_acc = self.builder.ins().sdiv(val_acc, arg.clone()),
+                    Operator::Mod => val_acc = self.builder.ins().srem(val_acc, arg.clone()),
+                    _ => unimplemented!(),
+                },
+                types::F32 | types::F64 => match op {
+                    Operator::Add => val_acc = self.builder.ins().fadd(val_acc, arg.clone()),
+                    Operator::Sub => val_acc = self.builder.ins().fsub(val_acc, arg.clone()),
+                    Operator::Mul => val_acc = self.builder.ins().fmul(val_acc, arg.clone()),
+                    Operator::Div => val_acc = self.builder.ins().fdiv(val_acc, arg.clone()),
+                    Operator::Mod => return Err(format!("{arg_type} cannot do modulus division")),
+                    _ => unimplemented!(),
+                },
+                _ => unimplemented!(),
+            };
         }
 
-        self.backend.compile()
+        Ok(Some(val_acc))
     }
-    
-    pub fn process_expression(expression: &Expression) -> Result<Self, String> {
-        let backend = JIT::default();
-        let statement = Self::transform(expression)?;
 
-        let mut ret = Self {
-            backend,
-            builtins: HashMap::new(),
-        };
-        ret.process(&statement)?;
+    pub fn translate(&mut self, ret_type: Type, expression: &Expression, siblings: Vec<&Expression>) -> Result<Vec<Value>, String> {
+        match expression {
+            Expression::List(children, _) => {
+                let mut values: Vec<Value> = Vec::new();
+                if let Some((first, others)) = children.split_first() {
+                    for cv in self.translate(ret_type, first, others.into_iter().collect())? {
+                        values.push(cv);
+                    }
+                }
+                Ok(values)
+            },
+            Expression::Value(literal, _) => {
+                if let Some(lit_val) = self.transform_literal(ret_type, literal, siblings)? {
+                    Ok(vec![lit_val])
+                }
+                else {
+                    Ok(vec![])
+                }
+            },
+        }
+    }
 
-        Ok(ret)
+    pub fn declare_var(&mut self, t: Type, name: Option<&str>) -> Result<Variable, String> {
+        declare_var(t, &mut self.builder, &mut self.vars, &mut self.var_idx, name)
+    }
+}
+
+fn declare_var(t: Type, fb: &mut FunctionBuilder, variables: &mut HashMap<String, Variable>, idx: &mut usize, name: Option<&str>) -> Result<Variable, String> {
+    let fn_name: String = if let Some(name) = name {
+        name.into()
+    } else {
+        format!("var_{}", *idx)
+    };
+
+    if let Some(var) = variables.get(&fn_name) {
+        Ok(*var)
+    } else {
+        let var = Variable::new(*idx);
+        variables.insert(fn_name.into(), var);
+        fb.declare_var(var, t);
+        *idx += 1;
+
+        Ok(var)
     }
 }

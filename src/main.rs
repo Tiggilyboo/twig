@@ -7,10 +7,15 @@ use std::mem;
 
 use frontend::*;
 use jit::*;
-use middleware::*;
 
+unsafe fn run_ptr<I, O>(ptr: *const u8, input: I) -> O {
+    let code_fn = mem::transmute::<_, fn(I) -> O>(ptr);
+    code_fn(input)
+}
 
 fn main() {
+    env_logger::init();
+
     let mut fe = Frontend::from_language(tree_sitter_commonlisp::language())
         .expect("Unable to initialize frontend");
 
@@ -32,31 +37,19 @@ fn main() {
                 } else {
                     return;
                 }
+                let mut jit = JIT::default();
 
-                match Middleware::process_expression(&expression) {
-                    Ok(mut middle) => {
-                        println!("Compiling...");
-                        match middle.compile() {
-                            Ok(_) => println!("Done."),
-                            Err(err) => println!("Error: {}", err),
-                        }
-                    },
-                    Err(err) => println!("{}", err),
-                }
- 
-                /*
-                
-                match jit.compile() {
+                println!("Compiling...");
+                match jit.compile(&expression) {
                     Ok(main_fptr) => {
+                        println!("Done.");
                         let ret: isize = unsafe {
-                            run_ptr(main_fptr, 42)
+                            run_ptr(main_fptr, 0)
                         };
-                        
-                        println!("Executing... {} -> {:?}", 0, ret);
+                        println!("-> {:?}", ret);
                     },
-                    Err(err) => println!("{:?}", err),
-                }*/
-
+                    Err(err) => println!("Error: {}", err),
+                }
             },
             Err(error) => panic!("{:?}", error),
         }

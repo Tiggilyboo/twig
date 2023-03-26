@@ -20,6 +20,56 @@ pub enum Literal {
     Identifier(String, Option<Type>),
 }
 
+impl Literal {
+    pub fn is_numeric(&self) -> bool {
+        match *self {
+            Self::Number(_, _) => true,
+            _ => false,
+        }
+    }
+    pub fn to_i32(&self) -> Result<i32, String> {
+        match self {
+            Self::Number(t, alloc) => match *t {
+                I32 => Ok(i32::from_le_bytes([alloc[0], alloc[1], alloc[2], alloc[3]])),
+                _ => Err(format!("Literal is of type {}, expected to be i32", t)),
+            },
+            _ => Err("Literal is not a Number, expected i32".into()),
+        }
+    }
+
+    pub fn is_i32(&self) -> bool {
+        match *self {
+            Self::Number(I32, _) => true,
+            _ => false,
+        }
+    }
+
+    pub fn to_f32(&self) -> Result<f32, String> {
+        match self {
+            Self::Number(t, alloc) => match *t {
+                F32 => Ok(f32::from_le_bytes([alloc[0], alloc[1], alloc[2], alloc[3]])),
+                _ => Err(format!("Literal is of type {}, expected to be f32", t)),
+            },
+            _ => Err("Literal is not a Number, expected i32".into()),
+        }
+    }
+
+    pub fn is_f32(&self) -> bool {
+        match *self {
+            Self::Number(F32, _) => true,
+            _ => false,
+        }
+    }
+
+    pub fn get_type(&self) -> Option<Type> {
+        match *self {
+            Self::Number(t, _) => Some(t),
+            Self::Identifier(_, t) => t,
+            _ => None,
+        }
+    }
+}
+
 impl FrontendGrammar<Literal> for CommonLispGrammar<Literal> {
     fn grammar() -> Grammar {
         Grammar::CommonLisp
