@@ -1,14 +1,16 @@
 use std::{collections::HashMap, hash::Hash};
 use super::*;
 use cranelift::prelude::*;
-use cranelift_module::{Linkage, FuncId};
+use cranelift_module::{Linkage, FuncId, FunctionDeclaration};
 use log::info;
 
 pub struct FunctionTranslator<'a> {
     pub builder: FunctionBuilder<'a>,
     pub f_id: FuncId,
     vars: HashMap<String, Variable>,
+    funcs: HashMap<String, FunctionDeclaration>,
     var_idx: usize,
+    fn_idx: usize,
 }
 
 impl <'a> FunctionTranslator <'a> {
@@ -17,7 +19,9 @@ impl <'a> FunctionTranslator <'a> {
             f_id,
             builder,
             vars: HashMap::new(),
+            funcs: HashMap::new(),
             var_idx: 0,
+            fn_idx: 0,
         }
     }
 
@@ -71,8 +75,60 @@ impl <'a> FunctionTranslator <'a> {
         Ok(Some(val))
     }
 
+    fn transform_function(&mut self, literal: &Literal, siblings: Vec<&Expression>) -> Result<(), String> {
+        info!("transform lit to func: {literal:?}, siblings: {siblings:?}");
+
+        match literal {
+            Literal::Identifier(ident, ident_ty) => {
+                if self.funcs.contains_key(ident) {
+                    return Err(format!("Function '{}' already defined.", ident));
+                }
+                let mut args = Vec::new();
+                let mut body_values = Vec::new();
+                if let Some(args_exp) = siblings.split_first() {
+                    match args_exp {
+                        (Expression::List(sub_exp_args, _), body) => {
+                            for arg in sub_exp_args {
+                                match arg {
+                                    Expression::Value(lit, _) => args.push(lit.clone()),
+                                    _ => return Err(format!("Expected argument for function '{}' to be a value, got: {:?}", ident, arg)),
+                                }
+                            }
+                            for exp in body {
+                                match self.translate(types::INVALID, exp, body.into()) {
+                                    Ok(body_value) => body_values.push(body_value),
+                                    Err(err) => return Err(format!("Function '{}' expression {:?}: {}", ident, exp, err)),
+                                }
+                            }
+                        },
+                        _ => return Err(format!("Expected arguments for function '{}' to be list, got: {:?}", ident, args_exp))
+                    }
+                } else {
+                    return Err(format!("Expected arguments for function '{}' in list after function definition for: {:?}", ident, literal));
+                }
+
+                let mut arg_values = Vec::new();
+                for arg in args {
+                    if let Some(arg_type) = arg.get_type() {
+                        match self.transform_literal(arg_type, &arg, Vec::new()) {
+                            Ok(Some(lit_val)) => arg_values.push(lit_val),
+                            Ok(None) => return Err(format!("Argument {:?} of type {:?} is not a value type!", arg, arg_type)),
+                            Err(err) => return Err(err),
+                        }
+                    } else {
+                        return Err(format!("Argument literal has no type: {:?}", arg))
+                    }
+                }
+
+                Ok(())
+            }
+            _ => return Err(format!("Literal {:?} expected to have identifier.", literal))
+        }
+    }
+
     fn transform_literal(&mut self, ret_type: Type, literal: &Literal, siblings: Vec<&Expression>) -> Result<Option<Value>, String> {
-        info!("transform lit: {literal:?} {siblings:?}");
+        info!("transform lit: {literal:?}, siblings: {siblings:?}");
+
         match literal {
             Literal::Comment(_) => Ok(None),
             Literal::Number(n_type, alloc) => self.transform_number(*n_type, alloc),
@@ -86,7 +142,7 @@ impl <'a> FunctionTranslator <'a> {
             Literal::Identifier(ident, ident_ty) => if self.vars.contains_key(ident) {
                 Ok(Some(self.builder.use_var(*self.vars.get(ident).unwrap())))
             } else {
-                Err(format!("{ident} ({ident_ty:?}) is not defined"))
+                Err(format!("{ident} ({siblings:?}) is not defined"))
             },
             _ => unimplemented!(),
         }
@@ -151,7 +207,17 @@ impl <'a> FunctionTranslator <'a> {
                 }
                 Ok(values)
             },
-            Expression::Value(literal, _) => {
+            Expression::Value(literal, field) => {
+                if let Some(field) = field {
+                    match field.as_str() {
+                        "function_name" => {
+                            self.transform_function(literal, siblings)?;
+                            return Ok(vec![])
+                        },
+                        _ => {
+                        }
+                    }
+                }
                 if let Some(lit_val) = self.transform_literal(ret_type, literal, siblings)? {
                     Ok(vec![lit_val])
                 }
@@ -163,25 +229,22 @@ impl <'a> FunctionTranslator <'a> {
     }
 
     pub fn declare_var(&mut self, t: Type, name: Option<&str>) -> Result<Variable, String> {
-        declare_var(t, &mut self.builder, &mut self.vars, &mut self.var_idx, name)
+        let fn_name: String = if let Some(name) = name {
+            name.into()
+        } else {
+            format!("var_{}", self.var_idx)
+        };
+
+        if let Some(var) = self.vars.get(&fn_name) {
+            Ok(*var)
+        } else {
+            let var = Variable::new(self.var_idx);
+            self.vars.insert(fn_name.into(), var);
+            self.builder.declare_var(var, t);
+            self.var_idx += 1;
+
+            Ok(var)
+        }
     }
 }
 
-fn declare_var(t: Type, fb: &mut FunctionBuilder, variables: &mut HashMap<String, Variable>, idx: &mut usize, name: Option<&str>) -> Result<Variable, String> {
-    let fn_name: String = if let Some(name) = name {
-        name.into()
-    } else {
-        format!("var_{}", *idx)
-    };
-
-    if let Some(var) = variables.get(&fn_name) {
-        Ok(*var)
-    } else {
-        let var = Variable::new(*idx);
-        variables.insert(fn_name.into(), var);
-        fb.declare_var(var, t);
-        *idx += 1;
-
-        Ok(var)
-    }
-}

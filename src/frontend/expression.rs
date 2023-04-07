@@ -1,3 +1,4 @@
+use log::info;
 use super::{
     FrontendGrammar,
     CommonLispGrammar,
@@ -34,7 +35,7 @@ impl FrontendGrammar<Expression> for CommonLispGrammar<Expression> {
             loop {
                 let c = cursor.node();
 
-                println!("cursor: {:?}", c.to_sexp());
+                info!("cursor: {:?}", c.to_sexp());
                 if let Some(s) = CommonLispGrammar::<Expression>::from_node(&c, source) {
                     values.push(s);
                 } 

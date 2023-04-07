@@ -1,6 +1,8 @@
 use core::f32;
 use cranelift::codegen::ir::types::*;
+use cranelift::prelude::Value;
 use tree_sitter::Node;
+use log::info;
 use super::operator::*;
 use super::comparator::*;
 use super::frontend_grammar::*;
@@ -70,6 +72,32 @@ impl Literal {
     }
 }
 
+impl From<i32> for Literal {
+    fn from(value: i32) -> Self {
+        Self::Number(I32, value.to_le_bytes().into())
+    }
+}
+impl From<i64> for Literal {
+    fn from(value: i64) -> Self {
+        Self::Number(I64, value.to_le_bytes().into())
+    }
+}
+impl From<f32> for Literal {
+    fn from(value: f32) -> Self {
+        Self::Number(F32, value.to_le_bytes().into())
+    }
+}
+impl From<f64> for Literal {
+    fn from(value: f64) -> Self {
+        Self::Number(F64, value.to_le_bytes().into())
+    }
+}
+impl From<String> for Literal {
+    fn from(value: String) -> Self {
+        Self::String(value)
+    }
+}
+
 impl FrontendGrammar<Literal> for CommonLispGrammar<Literal> {
     fn grammar() -> Grammar {
         Grammar::CommonLisp
@@ -85,6 +113,7 @@ impl FrontendGrammar<Literal> for CommonLispGrammar<Literal> {
                 } else if let Ok(cmp) = Comparator::try_from(node_text) {
                     Some(Literal::Symbol(Symbol::Comparator(cmp)))
                 } else {
+                    info!("{:?}", n);
                     Some(Literal::Identifier(node_text.to_string(), None))
                 }
             },
@@ -103,7 +132,7 @@ impl FrontendGrammar<Literal> for CommonLispGrammar<Literal> {
             "char_lit" | "str_lit" => Some(Literal::String(node_text.to_string())),
             "comment" => Some(Literal::Comment(node_text.to_string())),
             _ => {
-                println!("Unable to parse literal: {} = {}", node_text, n.to_sexp());
+                info!("Unable to parse literal: {} = {}", node_text, n.to_sexp());
                 None
             }
         }

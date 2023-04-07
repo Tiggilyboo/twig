@@ -2,6 +2,7 @@ mod frontend;
 mod middleware;
 mod jit;
 
+use log::info;
 use std::io::Read;
 use std::mem;
 
@@ -27,28 +28,32 @@ fn main() {
 
         match stdin.read(&mut chunk[..]) {
             Ok(len) => {
+                if len == 0 {
+                    info!("Empty expression");
+                    return;
+                }
                 let utf8_chunk = String::from_utf8(chunk[0..len].to_vec()).unwrap();
                 buffer.push_str(&utf8_chunk);
 
                 let expression: Expression;
                 if let Some(parsed_exp) = fe.parse(&buffer) {
-                    println!("=> {:#?}", parsed_exp);
+                    info!("=> {:#?}", parsed_exp);
                     expression = parsed_exp;
                 } else {
                     return;
                 }
                 let mut jit = JIT::default();
 
-                println!("Compiling...");
+                info!("Compiling...");
                 match jit.compile(&expression) {
                     Ok(main_fptr) => {
-                        println!("Done.");
+                        info!("Done.");
                         let ret: isize = unsafe {
                             run_ptr(main_fptr, 0)
                         };
                         println!("-> {:?}", ret);
                     },
-                    Err(err) => println!("Error: {}", err),
+                    Err(err) => panic!("Error: {}", err),
                 }
             },
             Err(error) => panic!("{:?}", error),
