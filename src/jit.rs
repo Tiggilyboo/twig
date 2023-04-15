@@ -175,15 +175,13 @@ impl JIT {
             for (i, p_type) in params.iter().enumerate() {
                 let val = trans.builder.block_params(entry_block)[i];
                 let var = trans.declare_var(*p_type, Some(&format!("p{i}")))?;
-                trans.builder.def_var(var, val);
             }
             let mut return_vars = Vec::new();
             for (i, r_type) in returns.iter().enumerate() {
-                let var = trans.declare_var(*r_type, Some(&format!("r{i}")))?;
-
+                let (var, _) = trans.declare_var(*r_type, Some(&format!("r{i}")))?;
                 return_vars.push(var);
             }
-            let translated_vals = trans.translate(types::I32, expression, vec![])?;
+            let translated_vals: Vec<Value> = trans.translate(expression, vec![])?.iter().map(|(v,t)| *v).collect();
             for (i, var) in return_vars.iter().enumerate() {
                 trans.builder.def_var(*var, translated_vals[i])
             }

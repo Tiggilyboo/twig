@@ -1,13 +1,13 @@
 use std::{collections::HashMap, hash::Hash};
 use super::*;
-use cranelift::prelude::*;
+use cranelift::{prelude::*, codegen::data_value::DataValue};
 use cranelift_module::{Linkage, FuncId, FunctionDeclaration};
 use log::info;
 
 pub struct FunctionTranslator<'a> {
     pub builder: FunctionBuilder<'a>,
     pub f_id: FuncId,
-    vars: HashMap<String, Variable>,
+    vars: HashMap<String, (Variable, Type)>,
     funcs: HashMap<String, FunctionDeclaration>,
     var_idx: usize,
     fn_idx: usize,
@@ -36,7 +36,7 @@ impl <'a> FunctionTranslator <'a> {
         }
     }
 
-    fn transform_number(&mut self, n_type: Type, alloc: &Vec<u8>) -> Result<Option<Value>, String> {
+    fn transform_number(&mut self, n_type: Type, alloc: &Vec<u8>) -> Result<Option<(Value, Type)>, String> {
         fn from_alloc_32(a: &Vec<u8>) -> Result<[u8; 4], String> {
             if a.len() < 4 {
                 return Err(format!("Number allocation did not contain enough bytes for 32bit value: {a:?}"))
@@ -69,17 +69,17 @@ impl <'a> FunctionTranslator <'a> {
             },
             _ => unimplemented!()
         };
-        self.builder.def_var(var, val);
+        self.builder.def_var(var.0, val);
         self.var_idx += 1;
 
-        Ok(Some(val))
+        Ok(Some((val, n_type)))
     }
 
     fn transform_function(&mut self, literal: &Literal, siblings: Vec<&Expression>) -> Result<(), String> {
         info!("transform lit to func: {literal:?}, siblings: {siblings:?}");
 
         match literal {
-            Literal::Identifier(ident, ident_ty) => {
+            Literal::Identifier(ident, _ident_ty) => {
                 if self.funcs.contains_key(ident) {
                     return Err(format!("Function '{}' already defined.", ident));
                 }
@@ -95,7 +95,7 @@ impl <'a> FunctionTranslator <'a> {
                                 }
                             }
                             for exp in body {
-                                match self.translate(types::INVALID, exp, body.into()) {
+                                match self.translate(exp, body.into()) {
                                     Ok(body_value) => body_values.push(body_value),
                                     Err(err) => return Err(format!("Function '{}' expression {:?}: {}", ident, exp, err)),
                                 }
@@ -110,7 +110,7 @@ impl <'a> FunctionTranslator <'a> {
                 let mut arg_values = Vec::new();
                 for arg in args {
                     if let Some(arg_type) = arg.get_type() {
-                        match self.transform_literal(arg_type, &arg, Vec::new()) {
+                        match self.transform_literal(&arg, Vec::new()) {
                             Ok(Some(lit_val)) => arg_values.push(lit_val),
                             Ok(None) => return Err(format!("Argument {:?} of type {:?} is not a value type!", arg, arg_type)),
                             Err(err) => return Err(err),
@@ -126,7 +126,7 @@ impl <'a> FunctionTranslator <'a> {
         }
     }
 
-    fn transform_literal(&mut self, ret_type: Type, literal: &Literal, siblings: Vec<&Expression>) -> Result<Option<Value>, String> {
+    fn transform_literal(&mut self, literal: &Literal, siblings: Vec<&Expression>) -> Result<Option<(Value, Type)>, String> {
         info!("transform lit: {literal:?}, siblings: {siblings:?}");
 
         match literal {
@@ -135,44 +135,43 @@ impl <'a> FunctionTranslator <'a> {
             Literal::Symbol(s) => {
                 let mut args = Vec::new();
                 for sibling in siblings {
-                    args.extend(self.translate(ret_type, sibling, vec![])?);
+                    args.extend(self.translate(sibling, vec![])?);
                 }
-                self.transform_symbol(ret_type, s, args)
+                self.transform_symbol(s, args)
             },
-            Literal::Identifier(ident, ident_ty) => if self.vars.contains_key(ident) {
-                Ok(Some(self.builder.use_var(*self.vars.get(ident).unwrap())))
-            } else {
-                Err(format!("{ident} ({siblings:?}) is not defined"))
+            Literal::Identifier(ident, ident_ty) => {
+                if let Some((var, var_ty)) = self.vars.get(ident) {
+                    Ok(Some((self.builder.use_var(*var), *var_ty)))
+                } else {
+                   Err(format!("{ident} ({siblings:?}) is not defined"))
+                }
             },
             _ => unimplemented!(),
         }
     }
 
-    fn transform_symbol(&mut self, ret_type: Type, symbol: &Symbol, args: Vec<Value>) -> Result<Option<Value>, String> {
+    fn transform_symbol(&mut self, symbol: &Symbol, args: Vec<(Value, Type)>) -> Result<Option<(Value, Type)>, String> {
         match symbol {
-            Symbol::Operator(op) => self.transform_operation(op, ret_type, args),
+            Symbol::Operator(op) => self.transform_operation(op, args),
             _ => unimplemented!(),
         }
     }
 
-    fn transform_operation(&mut self, op: &Operator, arg_type: Type, args: Vec<Value>) -> Result<Option<Value>, String> {
+    fn transform_operation(&mut self, op: &Operator, args: Vec<(Value, Type)>) -> Result<Option<(Value, Type)>, String> {
         let a_len = args.len();
 
         // TODO vector operations instead of single lane ops
 
-        let mut val_acc = if a_len > 0 {
-            args[0]
-        } else {
-            match arg_type {
-                types::I32 | types::I64 => self.builder.ins().iconst(arg_type, 0),
-                types::F32 => self.builder.ins().f32const(0f32),
-                types::F64 => self.builder.ins().f64const(0f64),
-                _ => unimplemented!(),
-            }
-        };
+        if a_len == 0 {
+            // Err?
+            return Ok(None);
+        }
+        let first_arg = args[0];
+        let val_ty = first_arg.1;
+        let mut val_acc = first_arg.0;
 
-        for arg in args.iter().skip(1) {
-            match arg_type {
+        for (arg, arg_type) in args.iter().skip(1) {
+            match *arg_type {
                 types::I32 | types::I64 => match op {
                     Operator::Add => val_acc = self.builder.ins().iadd(val_acc, arg.clone()),
                     Operator::Sub => val_acc = self.builder.ins().isub(val_acc, arg.clone()),
@@ -193,16 +192,16 @@ impl <'a> FunctionTranslator <'a> {
             };
         }
 
-        Ok(Some(val_acc))
+        Ok(Some((val_acc, val_ty)))
     }
 
-    pub fn translate(&mut self, ret_type: Type, expression: &Expression, siblings: Vec<&Expression>) -> Result<Vec<Value>, String> {
+    pub fn translate(&mut self, expression: &Expression, siblings: Vec<&Expression>) -> Result<Vec<(Value, Type)>, String> {
         match expression {
             Expression::List(children, _) => {
-                let mut values: Vec<Value> = Vec::new();
+                let mut values: Vec<(Value, Type)> = Vec::new();
                 if let Some((first, others)) = children.split_first() {
-                    for cv in self.translate(ret_type, first, others.into_iter().collect())? {
-                        values.push(cv);
+                    for (v, t) in self.translate(first, others.into_iter().collect())? {
+                        values.push((v, t));
                     }
                 }
                 Ok(values)
@@ -218,7 +217,7 @@ impl <'a> FunctionTranslator <'a> {
                         }
                     }
                 }
-                if let Some(lit_val) = self.transform_literal(ret_type, literal, siblings)? {
+                if let Some(lit_val) = self.transform_literal(literal, siblings)? {
                     Ok(vec![lit_val])
                 }
                 else {
@@ -228,7 +227,7 @@ impl <'a> FunctionTranslator <'a> {
         }
     }
 
-    pub fn declare_var(&mut self, t: Type, name: Option<&str>) -> Result<Variable, String> {
+    pub fn declare_var(&mut self, t: Type, name: Option<&str>) -> Result<(Variable, Type), String> {
         let fn_name: String = if let Some(name) = name {
             name.into()
         } else {
@@ -239,11 +238,11 @@ impl <'a> FunctionTranslator <'a> {
             Ok(*var)
         } else {
             let var = Variable::new(self.var_idx);
-            self.vars.insert(fn_name.into(), var);
             self.builder.declare_var(var, t);
+            self.vars.insert(fn_name.into(), (var, t));
             self.var_idx += 1;
 
-            Ok(var)
+            Ok((var, t))
         }
     }
 }
