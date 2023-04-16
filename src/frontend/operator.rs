@@ -1,3 +1,5 @@
+use std::fmt::{Display, Formatter};
+
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Operator {
@@ -25,3 +27,8 @@ impl TryFrom<&str> for Operator {
     }
 }
 
+impl Display for Operator {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}

@@ -1,19 +1,18 @@
 use core::f32;
 use cranelift::codegen::ir::types::*;
-use cranelift::prelude::Value;
 use tree_sitter::Node;
 use log::info;
 use super::operator::*;
 use super::comparator::*;
 use super::frontend_grammar::*;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Symbol {
     Operator(Operator),
     Comparator(Comparator),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Literal {
     Symbol(Symbol),
     Number(Type, Vec<u8>),
@@ -23,10 +22,16 @@ pub enum Literal {
 }
 
 impl Literal {
-    pub fn is_numeric(&self) -> bool {
+    pub fn get_identifier(&self) -> Option<&String> {
+        match self {
+            Self::Identifier(ident, _) => Some(ident),
+            _ => None,
+        }
+    }
+    pub fn get_number_type(&self) -> Option<Type> {
         match *self {
-            Self::Number(_, _) => true,
-            _ => false,
+            Self::Number(n_ty, _) => Some(n_ty),
+            _ => None,
         }
     }
     pub fn to_i32(&self) -> Result<i32, String> {

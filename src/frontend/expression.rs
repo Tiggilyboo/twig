@@ -1,4 +1,5 @@
 use log::info;
+
 use super::{
     FrontendGrammar,
     CommonLispGrammar,
@@ -7,7 +8,7 @@ use super::literal::*;
 use super::frontend_grammar::*;
 use tree_sitter::Node;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Expression {
     Value(Literal, Option<String>),
     List(Vec<Expression>, Option<String>),

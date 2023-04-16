@@ -1,16 +1,110 @@
-use std::{collections::HashMap, hash::Hash};
+use std::{collections::{HashMap, HashSet}, str::FromStr, fmt::{Formatter, Display}};
 use super::*;
-use cranelift::{prelude::*, codegen::data_value::DataValue};
-use cranelift_module::{Linkage, FuncId, FunctionDeclaration};
+use cranelift::prelude::*;
+use cranelift_module::{Linkage, FuncId};
 use log::info;
 
+#[derive(Debug, PartialEq)]
+pub struct TranslatorDependency {
+    pub ident: String,
+    pub dep_type: DependencyType,
+    pub exp: Expression,
+    pub siblings: Vec<Expression>, 
+    // Once the dependency has beeen resolved it has a result
+    pub result: Option<Box<TranslationResult>>,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum DependencyType {
+    Function,
+    Value,
+}
+
+impl ToString for DependencyType {
+    fn to_string(&self) -> String {
+        match *self {
+            DependencyType::Value => "value".into(),
+            DependencyType::Function => "function_name".into(),
+        }
+    }
+}
+impl FromStr for DependencyType {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "function_name" => Ok(DependencyType::Function),
+            "value" => Ok(DependencyType::Value),
+            _ => Err(format!("'{value}' did not match a DependencyType"))
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub enum TranslationResult {
+    None,
+    Value((Value, Type)),
+    Dependency(TranslatorDependency),
+}
+
+impl TranslationResult {
+    pub fn get_value(&self) -> Option<&(Value, Type)> {
+        match self {
+            TranslationResult::None => None,
+            TranslationResult::Dependency(ref dep) => dep.get_value(),
+            TranslationResult::Value(v) => Some(v),
+        }
+    }
+}
+
+impl TranslatorDependency {
+    pub fn new(exp: Expression, siblings: Vec<Expression>) -> Result<Self, String> {
+        let (ident, dep_type) = match &exp {
+            Expression::Value(Literal::Identifier(ident, _), Some(field)) => (ident.clone(), DependencyType::from_str(&field)?),
+            _ => unimplemented!(),
+        };
+
+        Ok(Self {
+            exp,
+            dep_type,
+            ident,
+            siblings,
+            result: None,
+        })
+    }
+
+    pub fn resolve(&mut self, result: TranslationResult) {
+        self.result = Some(Box::new(result));
+    }
+
+    pub fn get_value(&self) -> Option<&(Value, Type)> {
+        match &self.result {
+            Some(ref result) => {
+                let unboxed = result;
+                match **unboxed {
+                    TranslationResult::Value(ref value) => Some(value),
+                    TranslationResult::Dependency(ref dep) => dep.get_value(),
+                    TranslationResult::None => None,
+                }
+            },
+            _ => None,
+        }
+    }
+}
+
+impl Display for TranslatorDependency {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
 pub struct FunctionTranslator<'a> {
-    pub builder: FunctionBuilder<'a>,
     pub f_id: FuncId,
+    pub builder: FunctionBuilder<'a>,
     vars: HashMap<String, (Variable, Type)>,
-    funcs: HashMap<String, FunctionDeclaration>,
+    deps: HashMap<String, TranslatorDependency>,
+    returns: HashMap<usize, TranslationResult>,
     var_idx: usize,
-    fn_idx: usize,
 }
 
 impl <'a> FunctionTranslator <'a> {
@@ -19,24 +113,13 @@ impl <'a> FunctionTranslator <'a> {
             f_id,
             builder,
             vars: HashMap::new(),
-            funcs: HashMap::new(),
+            deps: HashMap::new(),
+            returns: HashMap::new(),
             var_idx: 0,
-            fn_idx: 0,
         }
     }
 
-    // Validate that all literals are of the same discriminant
-    fn validate_all_same_type<T>(a: &Vec<T>) -> bool {
-        if let Some(first) = a.first() {
-            let first_disc = std::mem::discriminant(first);
-            
-            a.iter().skip(1).all(|l| first_disc == std::mem::discriminant(l))
-        } else {
-            false
-        }
-    }
-
-    fn transform_number(&mut self, n_type: Type, alloc: &Vec<u8>) -> Result<Option<(Value, Type)>, String> {
+    fn transform_number(&mut self, n_type: Type, alloc: &Vec<u8>) -> Result<TranslationResult, String> {
         fn from_alloc_32(a: &Vec<u8>) -> Result<[u8; 4], String> {
             if a.len() < 4 {
                 return Err(format!("Number allocation did not contain enough bytes for 32bit value: {a:?}"))
@@ -72,76 +155,25 @@ impl <'a> FunctionTranslator <'a> {
         self.builder.def_var(var.0, val);
         self.var_idx += 1;
 
-        Ok(Some((val, n_type)))
+        Ok(TranslationResult::Value((val, n_type)))
     }
 
-    fn transform_function(&mut self, literal: &Literal, siblings: Vec<&Expression>) -> Result<(), String> {
-        info!("transform lit to func: {literal:?}, siblings: {siblings:?}");
+    fn transform_literal(&mut self, literal_expression: &'a Expression, siblings: Vec<&'a Expression>, parent: Option<&'a Expression>) -> Result<TranslationResult, String> {
+        info!("transform lit: {literal_expression:?}, siblings: {siblings:?}");
 
-        match literal {
-            Literal::Identifier(ident, _ident_ty) => {
-                if self.funcs.contains_key(ident) {
-                    return Err(format!("Function '{}' already defined.", ident));
-                }
-                let mut args = Vec::new();
-                let mut body_values = Vec::new();
-                if let Some(args_exp) = siblings.split_first() {
-                    match args_exp {
-                        (Expression::List(sub_exp_args, _), body) => {
-                            for arg in sub_exp_args {
-                                match arg {
-                                    Expression::Value(lit, _) => args.push(lit.clone()),
-                                    _ => return Err(format!("Expected argument for function '{}' to be a value, got: {:?}", ident, arg)),
-                                }
-                            }
-                            for exp in body {
-                                match self.translate(exp, body.into()) {
-                                    Ok(body_value) => body_values.push(body_value),
-                                    Err(err) => return Err(format!("Function '{}' expression {:?}: {}", ident, exp, err)),
-                                }
-                            }
-                        },
-                        _ => return Err(format!("Expected arguments for function '{}' to be list, got: {:?}", ident, args_exp))
-                    }
-                } else {
-                    return Err(format!("Expected arguments for function '{}' in list after function definition for: {:?}", ident, literal));
-                }
-
-                let mut arg_values = Vec::new();
-                for arg in args {
-                    if let Some(arg_type) = arg.get_type() {
-                        match self.transform_literal(&arg, Vec::new()) {
-                            Ok(Some(lit_val)) => arg_values.push(lit_val),
-                            Ok(None) => return Err(format!("Argument {:?} of type {:?} is not a value type!", arg, arg_type)),
-                            Err(err) => return Err(err),
-                        }
-                    } else {
-                        return Err(format!("Argument literal has no type: {:?}", arg))
-                    }
-                }
-
-                Ok(())
-            }
-            _ => return Err(format!("Literal {:?} expected to have identifier.", literal))
-        }
-    }
-
-    fn transform_literal(&mut self, literal: &Literal, siblings: Vec<&Expression>) -> Result<Option<(Value, Type)>, String> {
-        info!("transform lit: {literal:?}, siblings: {siblings:?}");
-
-        match literal {
-            Literal::Comment(_) => Ok(None),
-            Literal::Number(n_type, alloc) => self.transform_number(*n_type, alloc),
-            Literal::Symbol(s) => {
+        match literal_expression {
+            Expression::Value(Literal::Comment(_), _) => Ok(TranslationResult::None),
+            Expression::Value(Literal::Number(n_type, alloc), _) => self.transform_number(*n_type, alloc),
+            Expression::Value(Literal::Symbol(s), _) => {
                 let mut args = Vec::new();
                 for sibling in siblings {
-                    args.extend(self.translate(sibling, vec![])?);
+                    args.extend(self.translate(sibling, vec![], Some(literal_expression))?);
                 }
                 self.transform_symbol(s, args)
             },
-            Literal::Identifier(ident, ident_ty) => {
+            Expression::Value(Literal::Identifier(ident, ident_ty), _) => {
                 if let Some((var, var_ty)) = self.vars.get(ident) {
-                    Ok(Some((self.builder.use_var(*var), *var_ty)))
+                    Ok(TranslationResult::Value((self.builder.use_var(*var), *var_ty)))
                 } else {
                    Err(format!("{ident} ({siblings:?}) is not defined"))
                 }
@@ -150,78 +182,137 @@ impl <'a> FunctionTranslator <'a> {
         }
     }
 
-    fn transform_symbol(&mut self, symbol: &Symbol, args: Vec<(Value, Type)>) -> Result<Option<(Value, Type)>, String> {
+    fn transform_symbol(&mut self, symbol: &Symbol, args: Vec<TranslationResult>) -> Result<TranslationResult, String> {
         match symbol {
             Symbol::Operator(op) => self.transform_operation(op, args),
             _ => unimplemented!(),
         }
     }
 
-    fn transform_operation(&mut self, op: &Operator, args: Vec<(Value, Type)>) -> Result<Option<(Value, Type)>, String> {
+    fn transform_operation(&mut self, op: &Operator, args: Vec<TranslationResult>) -> Result<TranslationResult, String> {
         let a_len = args.len();
 
         // TODO vector operations instead of single lane ops
 
         if a_len == 0 {
             // Err?
-            return Ok(None);
+            return Ok(TranslationResult::None);
         }
-        let first_arg = args[0];
-        let val_ty = first_arg.1;
-        let mut val_acc = first_arg.0;
+        let mut val_ty: &Type;
+        let mut val_acc: Value;
+        match &args[0] {
+            TranslationResult::None => return Err(format!("Operator {op} has an empty argument")),
+            TranslationResult::Value((arg, arg_type)) => (val_acc, val_ty) = (arg.clone(), arg_type),
+            TranslationResult::Dependency(dep) => {
+                // all arguments must be resolved before doing the operation (FOR NOW...)
+                if let Some((dep_val, dep_ty)) = dep.get_value() {
+                    (val_acc, val_ty) = (dep_val.clone(), dep_ty);
+                } else {
+                    let siblings = dep.siblings.clone();
+                    let new_dep = TranslatorDependency::new(Expression::Value(Literal::Symbol(Symbol::Operator(op.clone())), None), siblings)?;
+                    return Ok(TranslationResult::Dependency(new_dep))
+                }
+            },
+        };
 
-        for (arg, arg_type) in args.iter().skip(1) {
-            match *arg_type {
-                types::I32 | types::I64 => match op {
-                    Operator::Add => val_acc = self.builder.ins().iadd(val_acc, arg.clone()),
-                    Operator::Sub => val_acc = self.builder.ins().isub(val_acc, arg.clone()),
-                    Operator::Mul => val_acc = self.builder.ins().imul(val_acc, arg.clone()),
-                    Operator::Div => val_acc = self.builder.ins().sdiv(val_acc, arg.clone()),
-                    Operator::Mod => val_acc = self.builder.ins().srem(val_acc, arg.clone()),
-                    _ => unimplemented!(),
+        for arg_result in args.iter().skip(1) {
+            match arg_result {
+                TranslationResult::None => continue,
+                TranslationResult::Value((arg, arg_type)) => {
+                    match *arg_type {
+                        types::I32 | types::I64 => match op {
+                            Operator::Add => val_acc = self.builder.ins().iadd(val_acc, arg.clone()),
+                            Operator::Sub => val_acc = self.builder.ins().isub(val_acc, arg.clone()),
+                            Operator::Mul => val_acc = self.builder.ins().imul(val_acc, arg.clone()),
+                            Operator::Div => val_acc = self.builder.ins().sdiv(val_acc, arg.clone()),
+                            Operator::Mod => val_acc = self.builder.ins().srem(val_acc, arg.clone()),
+                            _ => unimplemented!(),
+                        },
+                        types::F32 | types::F64 => match op {
+                            Operator::Add => val_acc = self.builder.ins().fadd(val_acc, arg.clone()),
+                            Operator::Sub => val_acc = self.builder.ins().fsub(val_acc, arg.clone()),
+                            Operator::Mul => val_acc = self.builder.ins().fmul(val_acc, arg.clone()),
+                            Operator::Div => val_acc = self.builder.ins().fdiv(val_acc, arg.clone()),
+                            Operator::Mod => return Err(format!("{arg_type} cannot do modulus division")),
+                            _ => unimplemented!(),
+                        },
+                        _ => unimplemented!(),
+                    }
                 },
-                types::F32 | types::F64 => match op {
-                    Operator::Add => val_acc = self.builder.ins().fadd(val_acc, arg.clone()),
-                    Operator::Sub => val_acc = self.builder.ins().fsub(val_acc, arg.clone()),
-                    Operator::Mul => val_acc = self.builder.ins().fmul(val_acc, arg.clone()),
-                    Operator::Div => val_acc = self.builder.ins().fdiv(val_acc, arg.clone()),
-                    Operator::Mod => return Err(format!("{arg_type} cannot do modulus division")),
-                    _ => unimplemented!(),
+                TranslationResult::Dependency(dep) => {
+                    // all arguments must be resolved before doing the operation (FOR NOW...)
+                    if let Some((dep_val, dep_ty)) = dep.get_value() {
+                        (val_acc, val_ty) = (dep_val.clone(), dep_ty);
+                    } else {
+                        let siblings = dep.siblings.clone();
+                        let new_dep = TranslatorDependency::new(Expression::Value(Literal::Symbol(Symbol::Operator(op.clone())), None), siblings)?;
+                        return Ok(TranslationResult::Dependency(new_dep))
+                    }
                 },
-                _ => unimplemented!(),
-            };
+            }
         }
 
-        Ok(Some((val_acc, val_ty)))
+        Ok(TranslationResult::Value((val_acc, val_ty.clone())))
     }
 
-    pub fn translate(&mut self, expression: &Expression, siblings: Vec<&Expression>) -> Result<Vec<(Value, Type)>, String> {
+    pub fn translate(&mut self, expression: &'a Expression, siblings: Vec<&'a Expression>, parent: Option<&'a Expression>) -> Result<Vec<TranslationResult>, String> {
+        info!("translating: {expression:?} parent: {parent:?}");
+
         match expression {
             Expression::List(children, _) => {
-                let mut values: Vec<(Value, Type)> = Vec::new();
+                let mut values: Vec<TranslationResult> = Vec::new();
                 if let Some((first, others)) = children.split_first() {
-                    for (v, t) in self.translate(first, others.into_iter().collect())? {
-                        values.push((v, t));
+                    for result in self.translate(first, others.into_iter().collect(), Some(expression))? {
+                        values.push(result);
                     }
                 }
                 Ok(values)
             },
-            Expression::Value(literal, field) => {
+            Expression::Value(_, field) => {
                 if let Some(field) = field {
                     match field.as_str() {
                         "function_name" => {
-                            self.transform_function(literal, siblings)?;
+                            // TODO: inefficent clones
+                            let dep = TranslatorDependency::new(expression.clone(), siblings.into_iter().cloned().collect())?;
+                            self.deps.insert(dep.ident.clone(), dep);
                             return Ok(vec![])
                         },
                         _ => {
                         }
                     }
                 }
-                if let Some(lit_val) = self.transform_literal(literal, siblings)? {
-                    Ok(vec![lit_val])
-                }
-                else {
-                    Ok(vec![])
+                match self.transform_literal(expression, siblings, parent) { 
+                    Ok(TranslationResult::None) => Ok(vec![]),
+                    Ok(result) => {
+                        info!("checking func returns for {result:?}");
+
+                        // alter function signature to return this root expression!
+                        if parent.is_none() {
+                            let idx = self.builder.func.signature.returns.len();
+
+
+                            match result {
+                                TranslationResult::Value((root_val, root_ty)) => {
+                                    info!("adding func sig ret: {root_val} of ty {root_ty} ({idx})");
+                                    self.builder.func.signature.returns.push(AbiParam::new(root_ty));
+                                    self.returns.insert(idx, TranslationResult::Value((root_val, root_ty)));
+                                },
+                                TranslationResult::Dependency(ref dep) => {
+                                    info!("adding func sig ret: {dep}({idx})");
+                                    if let Some((dep_val, dep_ty)) = dep.get_value() {
+                                        self.builder.func.signature.returns.push(AbiParam::new(dep_ty.clone()));
+                                        self.returns.insert(idx, TranslationResult::Value((dep_val.clone(), dep_ty.clone())));
+                                    } else {
+                                        // dependency not fulfilled yet...?
+                                        unreachable!()
+                                    }
+                                }
+                                _ => (),
+                            }
+                        }
+                        Ok(vec![result])
+                    },
+                    Err(err) => Err(err),
                 }
             },
         }
@@ -244,6 +335,21 @@ impl <'a> FunctionTranslator <'a> {
 
             Ok((var, t))
         }
+    }
+
+    pub fn finalize_returns(&mut self, function_block: Block) -> Vec<&(Value, Type)> {
+        let mut returns = Vec::new();
+        for ret_result in self.returns.values() {
+            if let Some(res_val) = ret_result.get_value() {
+                returns.push(res_val)
+            }
+            // TODO: Flag for forcing ALL deps resolved? ERRRR otherwise?
+        }
+
+        self.builder.append_block_params_for_function_params(function_block);
+        self.builder.append_block_params_for_function_returns(function_block);
+
+        returns
     }
 }
 
