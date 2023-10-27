@@ -1,7 +1,6 @@
 use std::io;
 use wasmtime::Engine;
 
-mod lexer;
 mod parser;
 use parser::Token;
 

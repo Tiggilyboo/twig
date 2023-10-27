@@ -1,5 +1,5 @@
 use core::fmt;
-use std::{char, io};
+use std::char;
 
 /*
 (?= 3 (+ 1 2))
@@ -21,6 +21,7 @@ impl fmt::Display for ParseErr {
 
 #[derive(Debug)]
 pub enum Comparator {
+    Not,
     EqualTo,
     NotEq,
     Less,
@@ -46,7 +47,7 @@ pub enum Token {
     AlphaNumeric(char),
     String(String),
     ConditionOpen,
-    Condition(Comparator),
+    Comparator(Comparator),
     Operation(Operator),
     Define,
     Invoke,
@@ -94,9 +95,10 @@ pub fn parse(input: &str) -> Result<Vec<Token>, ParseErr> {
             '(' => Token::Open,
             ')' => Token::Close,
             '?' => Token::ConditionOpen,
-            '=' => Token::Condition(Comparator::EqualTo),
-            '>' => Token::Condition(Comparator::Greater),
-            '<' => Token::Condition(Comparator::Less),
+            '!' => Token::Comparator(Comparator::Not),
+            '=' => Token::Comparator(Comparator::EqualTo),
+            '>' => Token::Comparator(Comparator::Greater),
+            '<' => Token::Comparator(Comparator::Less),
             '+' => Token::Operation(Operator::Add),
             '-' => Token::Operation(Operator::Sub),
             '/' => Token::Operation(Operator::Div),
@@ -109,11 +111,35 @@ pub fn parse(input: &str) -> Result<Vec<Token>, ParseErr> {
             _ => continue,
         };
 
-        match (chunk.last(), &cur) {
-            (_, Token::AlphaNumeric(_)) => {
+        match (tokens.last(), chunk.last(), &cur) {
+            (_, _, Token::AlphaNumeric(_)) => {
                 chunk.push(cur);
             }
-            (Some(Token::AlphaNumeric(_)), _) => {
+            (
+                Some(Token::Comparator(Comparator::Not)),
+                _,
+                Token::Comparator(Comparator::EqualTo),
+            ) => {
+                tokens.pop();
+                tokens.push(Token::Comparator(Comparator::NotEq));
+            }
+            (
+                Some(Token::Comparator(Comparator::Greater)),
+                _,
+                Token::Comparator(Comparator::EqualTo),
+            ) => {
+                tokens.pop();
+                tokens.push(Token::Comparator(Comparator::GreaterEq));
+            }
+            (
+                Some(Token::Comparator(Comparator::Less)),
+                _,
+                Token::Comparator(Comparator::EqualTo),
+            ) => {
+                tokens.pop();
+                tokens.push(Token::Comparator(Comparator::LessEq));
+            }
+            (_, Some(Token::AlphaNumeric(_)), _) => {
                 let combined = combine_alpha_numeric(chunk.as_slice());
                 tokens.push(combined);
                 tokens.push(cur);
