@@ -1,5 +1,4 @@
 use std::io;
-use wasmtime::Engine;
 
 mod parser;
 use parser::Token;
@@ -30,6 +29,4 @@ fn main() {
             }
         }
     }
-
-    let engine = Engine::default();
 }

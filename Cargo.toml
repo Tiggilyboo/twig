@@ -4,4 +4,4 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-wasmtime = { version = "14.0", features = ["async", "cache", "wat", "parallel-compilation", "cranelift", "pooling-allocator"] }
+# none!
