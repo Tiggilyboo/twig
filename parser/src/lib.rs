@@ -1,12 +1,6 @@
 #[rust_sitter::grammar("twig")]
 pub mod grammar {
-    use rust_sitter::Spanned;
-
-    /*
-        (. "Hello World")
-        (+ 1 2 3)
-        (:Chicken "Bawk")
-    */
+    use std::{error::Error, str::FromStr};
 
     #[rust_sitter::extra]
     pub struct Whitespace {
@@ -15,46 +9,112 @@ pub mod grammar {
     }
 
     #[derive(Debug)]
+    pub enum Comparator {
+        #[rust_sitter::leaf(text = "!=")]
+        NotEq,
+        #[rust_sitter::leaf(text = "<=")]
+        LessEq,
+        #[rust_sitter::leaf(text = ">=")]
+        GreaterEq,
+        #[rust_sitter::leaf(text = "=")]
+        Eq,
+        #[rust_sitter::leaf(text = ">")]
+        Greater,
+        #[rust_sitter::leaf(text = "<")]
+        Less,
+        #[rust_sitter::leaf(text = "!")]
+        Not,
+    }
+
+    #[derive(Debug)]
+    pub enum Operator {
+        #[rust_sitter::leaf(text = "+")]
+        Add,
+        #[rust_sitter::leaf(text = "-")]
+        Sub,
+        #[rust_sitter::leaf(text = "*")]
+        Mul,
+        #[rust_sitter::leaf(text = "/")]
+        Div,
+        #[rust_sitter::leaf(text = "%")]
+        Mod,
+        #[rust_sitter::leaf(text = "&")]
+        And,
+        #[rust_sitter::leaf(text = "|")]
+        Or,
+    }
+
+    #[derive(Debug)]
+    pub struct Identifier {
+        #[rust_sitter::leaf(pattern = r"[A-Za-z][A-Za-z0-9_]*", transform = |v| v.to_string())]
+        pub name: String,
+    }
+
+    impl Identifier {
+        pub fn from(name: &str) -> Self {
+            Self {
+                name: name.to_string(),
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    pub struct Numeric {
+        #[rust_sitter::leaf(pattern = r"(-)?\d+(\.\d+)?", transform = |v| v.to_string())]
+        _raw: String,
+    }
+
+    impl From<i32> for Numeric {
+        fn from(v: i32) -> Numeric {
+            Numeric::from(v.to_string())
+        }
+    }
+    impl From<String> for Numeric {
+        fn from(v: String) -> Numeric {
+            Numeric { _raw: v }
+        }
+    }
+
+    impl Numeric {
+        pub fn get_raw(&self) -> &str {
+            &self._raw
+        }
+
+        pub fn get_value<T>(&self) -> Option<T>
+        where
+            T: FromStr
+                + std::ops::Add<T>
+                + std::ops::Sub<T>
+                + std::ops::Div<T>
+                + std::ops::Mul<T>
+                + PartialEq<T>
+                + Eq
+                + PartialOrd<T>
+                + From<T>,
+        {
+            match self._raw.parse() {
+                Ok(v) => Some(v),
+                Err(_) => None,
+            }
+        }
+    }
+
+    #[derive(Debug)]
     #[rust_sitter::language]
     pub enum Expr {
-        Number(#[rust_sitter::leaf(pattern = r"\d+", transform = |v| v.parse().unwrap())] u32),
+        Number(Numeric),
         Alpha(#[rust_sitter::leaf(pattern = r"\w", transform = |v| v.parse().unwrap())] char),
         String(#[rust_sitter::leaf(pattern = r#"\".*?\""#, transform = |v| v.to_string())] String),
-        Identifier(
-            #[rust_sitter::leaf(pattern = r"[A-Za-z][A-Za-z0-9_]*", transform = |v| v.to_string())]
-            String,
-        ),
-        Define(#[rust_sitter::leaf(text = ":")] (), Spanned<Box<Expr>>),
 
-        Add(
-            #[rust_sitter::leaf(pattern = r"\(\s*\+")] (),
-            Spanned<Box<Expr>>,
-            #[rust_sitter::leaf(text = ")")] (),
-        ),
-        Sub(
-            #[rust_sitter::leaf(pattern = r"\(\s*\-")] (),
-            Spanned<Box<Expr>>,
-            #[rust_sitter::leaf(text = ")")] (),
-        ),
-        Mul(
-            #[rust_sitter::leaf(pattern = r"\(\s*\*")] (),
-            Spanned<Box<Expr>>,
-            #[rust_sitter::leaf(text = ")")] (),
-        ),
-        Div(
-            #[rust_sitter::leaf(pattern = r"\(\s*\/")] (),
-            Spanned<Box<Expr>>,
-            #[rust_sitter::leaf(text = ")")] (),
-        ),
-        Mod(
-            #[rust_sitter::leaf(pattern = r"\(\s*%")] (),
-            Spanned<Box<Expr>>,
-            #[rust_sitter::leaf(text = ")")] (),
-        ),
+        Identifier(Identifier),
+        Define(#[rust_sitter::leaf(text = ":")] (), Identifier, Box<Expr>),
+
+        Condition(Comparator, Box<Expr>),
+        Operation(Operator, Box<Expr>),
 
         List(
             #[rust_sitter::leaf(text = "(")] (),
-            Vec<Spanned<Expr>>,
+            Vec<Expr>,
             #[rust_sitter::leaf(text = ")")] (),
         ),
     }
@@ -115,6 +175,8 @@ fn convert_parse_error_to_diagnostics(
     }
 }
 
+pub use grammar::*;
+
 pub fn play() {
     let stdin = std::io::stdin();
 
@@ -133,7 +195,7 @@ pub fn play() {
     }
 }
 
-pub fn parse(input: &str) -> Option<grammar::Expr> {
+pub fn parse(input: &str) -> Option<Expr> {
     match grammar::parse(input) {
         Ok(expr) => Some(expr),
         Err(errs) => {

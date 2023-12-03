@@ -1,4 +1,3 @@
-use parser::grammar::Expr;
 use std::io::Write;
 
 fn main() {
@@ -17,6 +16,10 @@ fn main() {
 
         if let Some(expr) = parser::parse(input) {
             println!("{expr:?}");
+            match codegen::codegen(&expr) {
+                Ok(_) => println!("OK"),
+                Err(err) => println!("{err:?}"),
+            }
         } else {
             break;
         }
