@@ -1,32 +1,24 @@
-use std::io;
-
-mod parser;
-use parser::Token;
+use parser::grammar::Expr;
+use std::io::Write;
 
 fn main() {
-    let stdin = io::stdin();
+    let stdin = std::io::stdin();
 
     loop {
-        let mut buf = String::new();
-        match stdin.read_line(&mut buf) {
-            Err(err) => {
-                println!("{err}");
-                break;
-            }
-            _ => (),
+        print!("> ");
+        std::io::stdout().flush().unwrap();
+
+        let mut input = String::new();
+        stdin.read_line(&mut input).unwrap();
+        let input = input.trim();
+        if input.is_empty() {
+            break;
         }
 
-        let tokens: Option<Vec<Token>> = match parser::parse(&buf) {
-            Err(err) => {
-                println!("{err}");
-                None
-            }
-            Ok(tokens) => Some(tokens),
-        };
-        if let Some(tokens) = tokens {
-            for t in tokens {
-                println!("{t:?}")
-            }
+        if let Some(expr) = parser::parse(input) {
+            println!("{expr:?}");
+        } else {
+            break;
         }
     }
 }

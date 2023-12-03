@@ -1,0 +1,16 @@
+[package]
+name = "parser"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+[lib]
+
+[dependencies]
+rust-sitter = "0.4.1"
+codemap = "0.1.3"
+codemap-diagnostic = "0.1.1"
+
+[build-dependencies]
+rust-sitter-tool = "0.4.1"
+

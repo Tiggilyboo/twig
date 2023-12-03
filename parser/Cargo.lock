@@ -258,6 +258,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2fabcfbdc87f4758337ca535fb41a6d701b65693ce38287d856d1674551ec9b"
 
 [[package]]
+name = "grammar"
+version = "0.1.0"
+dependencies = [
+ "codemap",
+ "codemap-diagnostic",
+ "rust-sitter",
+ "rust-sitter-tool",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -449,16 +459,6 @@ name = "once_cell"
 version = "1.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dd8b5dd2ae5ed71462c540258bedcb51965123ad7e7ccf4b9a8cafaa4a63576d"
-
-[[package]]
-name = "parser"
-version = "0.1.0"
-dependencies = [
- "codemap",
- "codemap-diagnostic",
- "rust-sitter",
- "rust-sitter-tool",
-]
 
 [[package]]
 name = "percent-encoding"
@@ -906,13 +906,6 @@ dependencies = [
  "regex",
  "thiserror",
  "tree-sitter",
-]
-
-[[package]]
-name = "twig"
-version = "0.1.0"
-dependencies = [
- "parser",
 ]
 
 [[package]]
