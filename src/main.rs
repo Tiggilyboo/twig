@@ -1,4 +1,4 @@
-use std::io::Write;
+use std::{io::Write, path::Path};
 
 fn main() {
     let stdin = std::io::stdin();
@@ -16,7 +16,7 @@ fn main() {
 
         if let Some(expr) = parser::parse(input) {
             println!("{expr:?}");
-            match codegen::codegen(&expr) {
+            match codegen::compile(&expr, Path::new("twig.o").to_path_buf()) {
                 Ok(_) => println!("OK"),
                 Err(err) => println!("{err:?}"),
             }
