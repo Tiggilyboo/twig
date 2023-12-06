@@ -109,9 +109,18 @@ pub mod grammar {
         Identifier(Identifier),
         Define(#[rust_sitter::leaf(text = ":")] (), Identifier, Box<Expr>),
 
-        Condition(Comparator, Box<Expr>),
-        Operation(Operator, Box<Expr>),
-
+        Condition(
+            #[rust_sitter::leaf(text = "(")] (),
+            Comparator,
+            Vec<Expr>,
+            #[rust_sitter::leaf(text = ")")] (),
+        ),
+        Operation(
+            #[rust_sitter::leaf(text = "(")] (),
+            Operator,
+            Vec<Expr>,
+            #[rust_sitter::leaf(text = ")")] (),
+        ),
         List(
             #[rust_sitter::leaf(text = "(")] (),
             Vec<Expr>,

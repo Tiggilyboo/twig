@@ -236,9 +236,15 @@ impl Compiler {
         &mut self,
         builder: &mut FunctionBuilder,
         op: &Operator,
-        operand_expr: &Expr,
+        operand_expr: &Vec<Expr>,
     ) -> Result<Definition, CompileErr> {
-        let operand = self.codegen_func(builder, operand_expr)?;
+        let defined_operands: Vec<Definition> = operand_expr
+            .iter()
+            .map(|operand| self.codegen_func(builder, operand))
+            .flatten()
+            .collect();
+
+        let operand = Definition::combine(defined_operands);
         if operand.val_type.is_none() {
             return Err(CompileErr::UndefinedType(operand));
         }
@@ -361,7 +367,7 @@ impl Compiler {
 
                 Ok(Definition::from(results))
             }
-            Expr::Operation(op, operand) => self.codegen_op(builder, op, operand.as_ref()),
+            Expr::Operation((), op, operand, ()) => self.codegen_op(builder, op, operand),
             Expr::Define((), ident, value) => match value.as_ref() {
                 Expr::Number(_) => self.define_var(builder, &ident.name, value),
                 Expr::List((), _, ()) => self.define_var(builder, &ident.name, value),
