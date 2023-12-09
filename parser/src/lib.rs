@@ -1,6 +1,7 @@
 #[rust_sitter::grammar("twig")]
 pub mod grammar {
-    use std::{error::Error, str::FromStr};
+    use core::fmt;
+    use std::str::FromStr;
 
     #[rust_sitter::extra]
     pub struct Whitespace {
@@ -44,12 +45,17 @@ pub mod grammar {
         Or,
     }
 
-    #[derive(Debug)]
     pub struct Identifier {
         #[rust_sitter::leaf(pattern = r"[A-Za-z][A-Za-z0-9_]*", transform = |v| v.to_string())]
         pub name: String,
     }
 
+    impl fmt::Debug for Identifier {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            let n = &self.name;
+            write!(f, "{n}")
+        }
+    }
     impl Identifier {
         pub fn from(name: &str) -> Self {
             Self {
@@ -100,6 +106,42 @@ pub mod grammar {
     }
 
     #[derive(Debug)]
+    pub enum DefineType {
+        #[rust_sitter::leaf(text = "f")]
+        Function,
+    }
+
+    pub struct DefineExpr {
+        #[rust_sitter::leaf(text = "(")]
+        _start: (),
+
+        pub ty: Option<DefineType>,
+
+        #[rust_sitter::leaf(text = ":")]
+        _sep: (),
+
+        pub identifier: Identifier,
+
+        pub params: Option<Box<Expr>>,
+
+        pub body: Box<Expr>,
+
+        #[rust_sitter::leaf(text = ")")]
+        _end: (),
+    }
+
+    impl fmt::Debug for DefineExpr {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("DefineExpr")
+                .field("ty", &self.ty)
+                .field("identifier", &self.identifier)
+                .field("params", &self.params)
+                .field("body", &self.body)
+                .finish()
+        }
+    }
+
+    #[derive(Debug)]
     #[rust_sitter::language]
     pub enum Expr {
         Number(Numeric),
@@ -107,7 +149,7 @@ pub mod grammar {
         String(#[rust_sitter::leaf(pattern = r#"\".*?\""#, transform = |v| v.to_string())] String),
 
         Identifier(Identifier),
-        Define(#[rust_sitter::leaf(text = ":")] (), Identifier, Box<Expr>),
+        Define(DefineExpr),
 
         Condition(
             #[rust_sitter::leaf(text = "(")] (),
