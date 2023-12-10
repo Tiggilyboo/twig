@@ -1,7 +1,7 @@
-use cranelift::{
-    codegen::ir::{immediates::Offset32, StackSlot},
-    prelude::*,
-};
+use cranelift_codegen::entity::EntityRef;
+use cranelift_codegen::ir::types;
+use cranelift_codegen::ir::{immediates::Offset32, StackSlot, Type, Value};
+use cranelift_frontend::Variable;
 use cranelift_module::{DataId, FuncId};
 
 #[derive(Debug, Clone)]

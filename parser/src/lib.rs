@@ -23,8 +23,6 @@ pub mod grammar {
         Greater,
         #[rust_sitter::leaf(text = "<")]
         Less,
-        #[rust_sitter::leaf(text = "!")]
-        Not,
     }
 
     #[derive(Debug)]
@@ -39,6 +37,8 @@ pub mod grammar {
         Div,
         #[rust_sitter::leaf(text = "%")]
         Mod,
+        #[rust_sitter::leaf(text = "!")]
+        Not,
         #[rust_sitter::leaf(text = "&")]
         And,
         #[rust_sitter::leaf(text = "|")]
@@ -111,10 +111,17 @@ pub mod grammar {
         Integer,
         #[rust_sitter::leaf(text = "f")]
         Float,
+        #[rust_sitter::leaf(text = "s")]
+        String,
+        #[rust_sitter::leaf(text = "(s)")]
+        ListString,
+        #[rust_sitter::leaf(text = "(f)")]
+        ListFloat,
+        #[rust_sitter::leaf(text = "(i)")]
+        ListInteger,
     }
 
     pub struct DefineFunc {
-        #[rust_sitter::prec(2)]
         #[rust_sitter::leaf(text = "(")]
         _start: (),
 
@@ -211,7 +218,9 @@ pub mod grammar {
             #[rust_sitter::leaf(text = ")")] (),
         ),
         List(
-            #[rust_sitter::leaf(text = "(")] (),
+            #[rust_sitter::prec(2)]
+            #[rust_sitter::leaf(text = "(")]
+            (),
             Vec<Expr>,
             #[rust_sitter::leaf(text = ")")] (),
         ),

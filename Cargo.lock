@@ -157,7 +157,8 @@ dependencies = [
 name = "codegen"
 version = "0.1.0"
 dependencies = [
- "cranelift",
+ "cranelift-codegen",
+ "cranelift-frontend",
  "cranelift-module",
  "cranelift-native",
  "cranelift-object",
@@ -205,16 +206,6 @@ name = "core-foundation-sys"
 version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06ea2b9bc92be3c2baa9334a323ebca2d6f074ff852cd1d7b11064035cd3868f"
-
-[[package]]
-name = "cranelift"
-version = "0.102.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dccfd08bbe88dcb32fac79ad3f893407e18d6308b88d3650d6f0fe8c859a23b1"
-dependencies = [
- "cranelift-codegen",
- "cranelift-frontend",
-]
 
 [[package]]
 name = "cranelift-bforest"

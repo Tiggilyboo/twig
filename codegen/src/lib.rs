@@ -4,15 +4,22 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use cranelift::{
-    codegen::{
-        ir::{immediates::Offset32, Function, UserFuncName},
-        verifier::VerifierErrors,
-        verify_function, Context,
-    },
-    prelude::{settings::Flags, *},
+use cranelift_codegen::ir::{
+    condcodes, AbiParam, InstBuilder, Signature, StackSlotData, StackSlotKind,
 };
-use cranelift_module::{DataDescription, Linkage, Module, ModuleError};
+use cranelift_codegen::settings::Flags;
+use cranelift_codegen::{
+    entity::EntityRef,
+    ir::types,
+    ir::{immediates::Offset32, Function, UserFuncName},
+    ir::{Type, Value},
+    settings,
+    settings::*,
+    verifier::VerifierErrors,
+    verify_function,
+};
+use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
+use cranelift_module::{Linkage, Module, ModuleError};
 use cranelift_object::{ObjectBuilder, ObjectModule};
 use parser::*;
 
@@ -32,6 +39,7 @@ pub enum CompileErr {
     IdentifierExists(String),
     DefinitionExists(Definition),
     InvalidOperation(String),
+    InvalidCondition(String),
     TypeMismatch(String),
     VariableErr(String),
     IndexOutOfRange(String),
@@ -45,6 +53,7 @@ pub struct Compiler {
     symbols: HashMap<String, Symbol>,
     sig_count: u32,
     debug: bool,
+    pointer_ty: Type,
 }
 
 impl Compiler {
@@ -57,6 +66,7 @@ impl Compiler {
         let obj_builder = ObjectBuilder::new(isa, name, cranelift_module::default_libcall_names())
             .map_err(|e| CompileErr::InitErr(e.to_string()))?;
         let module = ObjectModule::new(obj_builder);
+        let pointer_ty = module.target_config().pointer_type();
 
         Ok(Self {
             flags,
@@ -66,12 +76,14 @@ impl Compiler {
             symbols: HashMap::new(),
             sig_count: 0,
             debug: true,
+            pointer_ty,
         })
     }
 
-    fn get_def(&self, name: &str) -> Option<&Definition> {
+    fn def_by_name(&self, name: &str) -> Option<&Definition> {
         if let Some(index) = self.symbols.get(name) {
             if let Some(def) = self.definitions.get(index) {
+                println!("found {name} def: {def:?}");
                 return Some(def);
             }
         }
@@ -79,12 +91,9 @@ impl Compiler {
         None
     }
 
-    fn register_def(&mut self, def: &Definition) -> Result<(), CompileErr> {
-        if let Some(existing) = self.definitions.insert(def.symbol(), def.clone()) {
-            Err(CompileErr::DefinitionExists(existing.clone()))
-        } else {
-            Ok(())
-        }
+    fn try_register_def(&mut self, def: &Definition) -> bool {
+        println!("registered: {def:?}");
+        return self.definitions.insert(def.symbol(), def.clone()).is_none();
     }
 
     fn register_symbol(&mut self, name: &str, symbol: Symbol) -> Result<(), CompileErr> {
@@ -113,6 +122,14 @@ impl Compiler {
         sig_count
     }
 
+    fn return_type_to_ir(&self, ret_type: &ReturnType) -> Type {
+        match ret_type {
+            ReturnType::Integer => types::I64,
+            ReturnType::Float => types::F64,
+            ReturnType::String => self.pointer_ty,
+            _ => self.pointer_ty,
+        }
+    }
     fn define_var(
         &mut self,
         builder: &mut FunctionBuilder,
@@ -127,7 +144,7 @@ impl Compiler {
 
         match value {
             Expr::Identifier(identifier) => {
-                let ident_def = self.get_def(&identifier.name).cloned();
+                let ident_def = self.def_by_name(&identifier.name).cloned();
 
                 if let Some(ident_def) = ident_def {
                     self.register_symbol(&identifier.name, ident_def.symbol())?;
@@ -143,7 +160,7 @@ impl Compiler {
                 builder.def_var(var, var_val.1);
 
                 let def = Definition::new(var_val.0, DefinedValue::Variable(var));
-                self.register_def(&def)?;
+                self.try_register_def(&def);
                 self.register_symbol(name, def.symbol())?;
 
                 Ok(def)
@@ -163,7 +180,7 @@ impl Compiler {
                 body,
                 ..
             } => {
-                let returns = vec![return_type_to_ir(ty)];
+                let returns = vec![self.return_type_to_ir(ty)];
 
                 self.define_func(
                     &identifier.name,
@@ -187,7 +204,7 @@ impl Compiler {
         let mut sig = Signature::new(self.module.isa().default_call_conv());
 
         for p in params {
-            let pty_ir = return_type_to_ir(&p.ty);
+            let pty_ir = self.return_type_to_ir(&p.ty);
             sig.params.push(AbiParam::new(pty_ir));
         }
         for r in returns {
@@ -209,11 +226,11 @@ impl Compiler {
             let entry_block = builder.create_block();
 
             for p in params {
-                let ir_ty = return_type_to_ir(&p.ty);
+                let ir_ty = self.return_type_to_ir(&p.ty);
                 let param_val = builder.append_block_param(entry_block, ir_ty);
                 let param_def = Definition::new(ir_ty, DefinedValue::Value(param_val));
 
-                self.register_def(&param_def)?;
+                self.try_register_def(&param_def);
                 self.register_symbol(&p.identifier.name, param_def.symbol())?;
             }
 
@@ -221,7 +238,7 @@ impl Compiler {
             builder.seal_block(entry_block);
 
             res = self.codegen_func(&mut builder, body)?;
-            self.register_def(&res)?;
+            self.try_register_def(&res);
             self.register_symbol(name, res.symbol())?;
 
             // Determine how to return the function result
@@ -237,19 +254,14 @@ impl Compiler {
                         resolved_values.len()
                     )));
                 }
+                let mut return_values: Vec<Value> = Vec::with_capacity(returns.len());
                 for i in 0..resolved_values.len() {
-                    if returns[i] != resolved_values[i].0 {
-                        let resolved_types: Vec<&Type> =
-                            resolved_values.iter().map(|(rt, _)| rt).collect();
-                        return Err(CompileErr::TypeMismatch(format!(
-                            "{name}: expected {returns:?} but got {resolved_types:?}"
-                        )));
-                    }
+                    // cast to fit return type?
+                    let (rt, rv) = resolved_values[i];
+                    return_values.push(cast_value(&mut builder, rt, returns[i], rv));
                 }
 
-                let resolved_values: Vec<Value> =
-                    resolved_values.iter().map(|(_, rv)| *rv).collect();
-                builder.ins().return_(&resolved_values);
+                builder.ins().return_(&return_values);
             }
 
             builder.seal_all_blocks();
@@ -261,16 +273,12 @@ impl Compiler {
 
         verify_function(&func, &self.flags).map_err(|e| CompileErr::VerifierErr(e))?;
 
-        let mut ctx = codegen::Context::for_function(func);
+        let mut ctx = cranelift_codegen::Context::for_function(func);
         self.module
             .define_function(func_id, &mut ctx)
             .map_err(|e| CompileErr::ModuleErr(e))?;
 
         Ok(res)
-    }
-
-    fn pointer_type(&self) -> Type {
-        self.module.target_config().pointer_type()
     }
 
     fn resolve_value(
@@ -288,19 +296,19 @@ impl Compiler {
                 .map(|v| Some((defined.val_type, v)))
                 .map_err(|e| CompileErr::VariableErr(e.to_string())),
             DefinedValue::Data(data_id) => {
-                let pointer = self.pointer_type();
+                let pointer = self.pointer_ty;
                 let data = self.module.declare_data_in_func(*data_id, builder.func);
                 let value = builder.ins().global_value(pointer, data);
                 Ok(Some((defined.val_type, value)))
             }
             DefinedValue::Function(func_id) => {
-                let pointer = self.pointer_type();
+                let pointer = self.pointer_ty;
                 let func_ref = self.module.declare_func_in_func(*func_id, builder.func);
                 let value = builder.ins().func_addr(pointer, func_ref);
                 Ok(Some((defined.val_type, value)))
             }
             DefinedValue::Stack { slot, items } => {
-                let pointer = self.pointer_type();
+                let pointer = self.pointer_ty;
 
                 if let Some(stack_index) = stack_index {
                     if let Some(item) = items.get(stack_index) {
@@ -349,41 +357,17 @@ impl Compiler {
         op: &Operator,
         operands: Vec<Definition>,
     ) -> Result<(Type, Vec<Value>), CompileErr> {
-        let mut accumulator_values: Vec<Value> = Vec::new();
+        let mut accumulator_values: Vec<(Type, Value)> = Vec::new();
         let mut accumulator_type: Option<Type> = None;
 
         for defined_op in operands.iter() {
-            if let Some(op_res) = self.resolve_value(builder, expr, &defined_op, None)? {
-                if let Some(acc_type) = accumulator_type {
-                    if let Some(new_acc_type) =
-                        get_max_operable_type(op, acc_type, defined_op.val_type)
-                    {
-                        accumulator_values.push(op_res.1);
-                        accumulator_type = Some(new_acc_type);
-                    } else {
-                        let defined_op_type = defined_op.val_type;
-                        return Err(CompileErr::InvalidOperation(
-                            format!("Can't {op:?} for {accumulator_type:?} and {defined_op_type}")
-                                .to_string(),
-                        ));
-                    }
-                } else {
-                    accumulator_values.push(op_res.1);
-                    accumulator_type = Some(defined_op.val_type);
-                }
-            } else {
-                return Err(CompileErr::InvalidOperation(
-                    format!("Can't {op:?}: {expr:?}").to_string(),
-                ));
+            let op_res = self.resolve_values(builder, expr, &defined_op)?;
+            for pair in op_res {
+                accumulator_values.push(pair);
             }
         }
 
-        match accumulator_type {
-            Some(acc_type) => Ok((acc_type, accumulator_values)),
-            None => Err(CompileErr::InvalidOperation(
-                format!("{operands:?}").to_string(),
-            )),
-        }
+        cast_to_largest(builder, expr, accumulator_values)
     }
 
     fn codegen_op(
@@ -396,41 +380,48 @@ impl Compiler {
         let defined_operands: Vec<Definition> = operand_expr
             .iter()
             .map(|operand| self.codegen_func(builder, operand))
+            .fuse()
             .flatten()
             .collect();
+
+        if defined_operands.len() != operand_expr.len() {
+            return Err(CompileErr::InvalidOperation(format!(
+                "unresolbed values in: {expr:?}"
+            )));
+        }
 
         println!("op: {op:?}, operands: {defined_operands:?}");
 
         let (accumulator_type, values) =
             self.codegen_op_components(builder, expr, op, defined_operands)?;
 
-        let mut accumulator = builder.ins().iconst(accumulator_type, 0);
+        let mut accumulator = *values.iter().nth(0).unwrap();
 
         if accumulator_type.is_int() {
             match op {
                 Operator::Add => {
-                    for val in values.iter() {
+                    for val in values.iter().skip(1) {
                         accumulator = builder.ins().iadd(accumulator, *val);
                     }
                 }
                 Operator::Sub => {
-                    for val in values.iter() {
+                    for val in values.iter().skip(1) {
                         accumulator = builder.ins().isub(accumulator, *val);
                     }
                 }
                 Operator::Mul => {
-                    for val in values.iter() {
+                    for val in values.iter().skip(1) {
                         accumulator = builder.ins().imul(accumulator, *val);
                     }
                 }
                 Operator::Div => {
                     // DIV 0
-                    for val in values.iter() {
+                    for val in values.iter().skip(1) {
                         accumulator = builder.ins().sdiv(accumulator, *val);
                     }
                 }
                 Operator::Mod => {
-                    for val in values.iter() {
+                    for val in values.iter().skip(1) {
                         accumulator = builder.ins().srem(accumulator, *val);
                     }
                 }
@@ -483,6 +474,21 @@ impl Compiler {
         Ok(Definition::from((accumulator_type, accumulator)))
     }
 
+    fn codegen_func_vec(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        expr_vec: &Vec<&Expr>,
+    ) -> Result<Vec<Definition>, CompileErr> {
+        let results: Vec<Definition> = expr_vec
+            .iter()
+            .map(|item| self.codegen_func(builder, item))
+            .fuse()
+            .flatten()
+            .collect();
+
+        Ok(results)
+    }
+
     fn codegen_func(
         &mut self,
         builder: &mut FunctionBuilder,
@@ -491,7 +497,7 @@ impl Compiler {
         let func_name = builder.func.name.get_user();
         match expr {
             Expr::Identifier(identifier) => {
-                if let Some(defined) = self.get_def(&identifier.name) {
+                if let Some(defined) = self.def_by_name(&identifier.name) {
                     Ok(defined.clone())
                 } else {
                     Err(CompileErr::UndefinedIdentifier(identifier.name.to_string()))
@@ -506,13 +512,12 @@ impl Compiler {
                     )))
                 }
             }
+            Expr::Condition((), comparator, items, ()) => {
+                let results = self.codegen_func_vec(builder, &items.iter().collect())?;
+                self.codegen_cond(builder, expr, comparator, results.iter().collect())
+            }
             Expr::List((), items, ()) => {
-                let results: Vec<Definition> = items
-                    .iter()
-                    .map(|item| self.codegen_func(builder, item))
-                    .flatten()
-                    .collect();
-
+                let results = self.codegen_func_vec(builder, &items.iter().collect())?;
                 self.codegen_stack(builder, expr, results.iter().collect())
             }
             Expr::Operation((), op, operand, ()) => self.codegen_op(builder, expr, op, operand),
@@ -524,6 +529,46 @@ impl Compiler {
                 format!("Unhandled expression in func {func_name:?}: {expr:?}").to_string(),
             )),
         }
+    }
+
+    fn codegen_cond(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        expr: &Expr,
+        comparator: &Comparator,
+        operands: Vec<&Definition>,
+    ) -> Result<Definition, CompileErr> {
+        let mut operand_ir = Vec::new();
+        for operand in operands {
+            if let Some(pair) = self.resolve_value(builder, expr, &operand, None)? {
+                operand_ir.push(pair);
+            }
+        }
+
+        let (ty, operand_values) = cast_to_largest(builder, expr, operand_ir)?;
+        let mut cmp = *operand_values.first().unwrap();
+
+        if ty.is_invalid() {
+            return Err(CompileErr::InvalidCondition(format!(
+                "condition {comparator:?} for {expr:?} has invalid operands"
+            )));
+        } else if ty.is_int() {
+            let cc = condcode_int(comparator);
+            for value in operand_values.iter().skip(1) {
+                cmp = builder.ins().icmp(cc, cmp, *value);
+            }
+        } else if ty.is_float() {
+            let cc = condcode_float(comparator);
+            for value in operand_values.iter().skip(1) {
+                cmp = builder.ins().fcmp(cc, cmp, *value);
+            }
+        } else {
+            return Err(CompileErr::InvalidCondition(format!(
+                "unable to compare {comparator:?} for {expr:?}"
+            )));
+        }
+
+        Ok(Definition::new(ty, DefinedValue::Value(cmp)))
     }
 
     fn codegen_stack(
@@ -540,7 +585,7 @@ impl Compiler {
         let mut offset: i32 = 0;
         let mut stored_items: Vec<(Type, Offset32)> = Vec::new();
         for item in stack_items {
-            if let Some((item_ty, item_value)) = self.resolve_value(builder, expr, &item, None)? {
+            if let Some((_item_ty, item_value)) = self.resolve_value(builder, expr, &item, None)? {
                 builder
                     .ins()
                     .stack_store(item_value, slot, Offset32::new(offset));
@@ -554,7 +599,7 @@ impl Compiler {
         }
 
         let def = Definition::new(
-            self.pointer_type(),
+            self.pointer_ty,
             DefinedValue::Stack {
                 slot,
                 items: stored_items,
@@ -567,14 +612,19 @@ impl Compiler {
     fn codegen(&mut self, expr: &Expr) -> Result<Definition, CompileErr> {
         match expr {
             Expr::Function(def_expr) => {
-                return self.define_func_expr(def_expr);
+                if def_expr.identifier.name.to_lowercase() != "main" {
+                    Err(CompileErr::Err(
+                        "Expected function declaration for entry point \"main\"".to_string(),
+                    ))
+                } else {
+                    self.define_func_expr(def_expr)
+                }
             }
-            _ => (),
+            _ => Err(CompileErr::Err(
+                format!("Expected function declaration like (i:main ()), got: {expr:?}")
+                    .to_string(),
+            )),
         }
-
-        Err(CompileErr::Err(
-            format!("Expected function declaration like (i:main ()), got: {expr:?}").to_string(),
-        ))
     }
 }
 
@@ -657,30 +707,98 @@ fn numeric_to_value(builder: &mut FunctionBuilder, numeric: &Numeric) -> Option<
     None
 }
 
-fn get_max_operable_type(op: &Operator, t1: Type, t2: Type) -> Option<Type> {
-    match op {
-        Operator::And | Operator::Or => {
-            return None;
-        }
-        _ => (),
-    }
+fn condcode_int(comparator: &Comparator) -> condcodes::IntCC {
+    use condcodes::*;
 
-    if t1 == t2 {
-        Some(t1)
-    } else if (t1.is_int() && t2.is_int()) || (t1.is_float() && t2.is_float()) {
-        if t1.bits() > t2.bits() {
-            Some(t1)
-        } else {
-            Some(t2)
-        }
-    } else {
-        None
+    match comparator {
+        Comparator::Eq => IntCC::Equal,
+        Comparator::NotEq => IntCC::NotEqual,
+        Comparator::Less => IntCC::SignedLessThan,
+        Comparator::LessEq => IntCC::SignedLessThanOrEqual,
+        Comparator::Greater => IntCC::SignedGreaterThan,
+        Comparator::GreaterEq => IntCC::SignedGreaterThanOrEqual,
     }
 }
 
-fn return_type_to_ir(ret_type: &ReturnType) -> Type {
-    match ret_type {
-        ReturnType::Integer => types::I64,
-        ReturnType::Float => types::F64,
+fn condcode_float(comparator: &Comparator) -> condcodes::FloatCC {
+    use condcodes::*;
+
+    return match comparator {
+        Comparator::Eq => FloatCC::Equal,
+        Comparator::NotEq => FloatCC::NotEqual,
+        Comparator::Less => FloatCC::LessThan,
+        Comparator::LessEq => FloatCC::LessThanOrEqual,
+        Comparator::Greater => FloatCC::GreaterThan,
+        Comparator::GreaterEq => FloatCC::GreaterThanOrEqual,
+    };
+}
+
+fn cast_value(builder: &mut FunctionBuilder, from: Type, to: Type, value: Value) -> Value {
+    if from == to {
+        return value;
     }
+    match (from, to) {
+        (integer, float) if integer.is_int() && float.is_float() => {
+            builder.ins().fcvt_from_sint(to, value)
+        }
+        (float, integer) if float.is_float() && integer.is_int() => {
+            builder.ins().fcvt_to_sint(to, value)
+        }
+        (integer, smaller_integer)
+            if integer.is_int()
+                && smaller_integer.is_int()
+                && integer.lane_bits() > smaller_integer.lane_bits() =>
+        {
+            builder.ins().ireduce(smaller_integer, value)
+        }
+        (smaller_integer, integer)
+            if integer.is_int()
+                && smaller_integer.is_int()
+                && integer.lane_bits() > smaller_integer.lane_bits() =>
+        {
+            builder.ins().sextend(integer, value)
+        }
+        (types::F32, types::F64) => builder.ins().fpromote(to, value),
+        (types::F64, types::F32) => builder.ins().fdemote(to, value),
+        _ => unreachable!("cast from {} to {}", from, to),
+    }
+}
+
+fn cast_to_largest(
+    builder: &mut FunctionBuilder,
+    expr: &Expr,
+    items: Vec<(Type, Value)>,
+) -> Result<(Type, Vec<Value>), CompileErr> {
+    if items.len() == 0 {
+        return Ok((types::INVALID, Vec::with_capacity(0)));
+    }
+
+    let mut largest: Option<Type> = None;
+
+    for (ty, _) in items.iter() {
+        if ty.is_ref() || ty.is_special() {
+            return Err(CompileErr::TypeMismatch(format!(
+                "Unsupported type {ty} in expression: {expr:?}"
+            )));
+        }
+        if let Some(mut largest) = &mut largest {
+            if (largest.is_int() && ty.is_int()) || (largest.is_float() && ty.is_float()) {
+                if ty.lane_bits() < largest.lane_bits() {
+                    largest = *ty;
+                }
+            } else if largest.is_int() && ty.is_float() {
+                largest = *ty;
+            }
+        } else {
+            largest = Some(*ty);
+        }
+    }
+    let largest = largest.unwrap();
+
+    let mut results = Vec::new();
+    for (item_ty, item_val) in items {
+        results.push(cast_value(builder, item_ty, largest, item_val));
+    }
+
+    Ok((largest, results))
 }
