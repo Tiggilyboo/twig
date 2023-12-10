@@ -106,23 +106,32 @@ pub mod grammar {
     }
 
     #[derive(Debug)]
-    pub enum DefineType {
+    pub enum ReturnType {
+        #[rust_sitter::leaf(text = "i")]
+        Integer,
         #[rust_sitter::leaf(text = "f")]
-        Function,
+        Float,
     }
 
-    pub struct DefineExpr {
+    pub struct DefineFunc {
+        #[rust_sitter::prec(2)]
         #[rust_sitter::leaf(text = "(")]
         _start: (),
 
-        pub ty: Option<DefineType>,
+        pub ty: ReturnType,
 
         #[rust_sitter::leaf(text = ":")]
         _sep: (),
 
         pub identifier: Identifier,
 
-        pub params: Option<Box<Expr>>,
+        #[rust_sitter::leaf(text = "(")]
+        _p_start: (),
+
+        pub params: Vec<Param>,
+
+        #[rust_sitter::leaf(text = ")")]
+        _p_end: (),
 
         pub body: Box<Expr>,
 
@@ -130,9 +139,31 @@ pub mod grammar {
         _end: (),
     }
 
-    impl fmt::Debug for DefineExpr {
+    pub struct DefineVar {
+        #[rust_sitter::prec(1)]
+        #[rust_sitter::leaf(text = "(")]
+        _start: (),
+
+        #[rust_sitter::leaf(text = ":")]
+        _sep: (),
+
+        pub identifier: Identifier,
+
+        pub body: Box<Expr>,
+
+        #[rust_sitter::leaf(text = ")")]
+        _end: (),
+    }
+
+    impl DefineFunc {
+        pub fn any(&self) -> bool {
+            self.params.len() > 0
+        }
+    }
+
+    impl fmt::Debug for DefineFunc {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.debug_struct("DefineExpr")
+            f.debug_struct("DefineFunc")
                 .field("ty", &self.ty)
                 .field("identifier", &self.identifier)
                 .field("params", &self.params)
@@ -140,16 +171,32 @@ pub mod grammar {
                 .finish()
         }
     }
+    impl fmt::Debug for DefineVar {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("DefineVar")
+                .field("identifier", &self.identifier)
+                .field("body", &self.body)
+                .finish()
+        }
+    }
+
+    #[derive(Debug)]
+    pub enum DefineExpr {
+        #[rust_sitter::prec(1)]
+        Function(DefineFunc),
+        #[rust_sitter::prec(2)]
+        Variable(DefineVar),
+    }
 
     #[derive(Debug)]
     #[rust_sitter::language]
     pub enum Expr {
         Number(Numeric),
-        Alpha(#[rust_sitter::leaf(pattern = r"\w", transform = |v| v.parse().unwrap())] char),
         String(#[rust_sitter::leaf(pattern = r#"\".*?\""#, transform = |v| v.to_string())] String),
 
         Identifier(Identifier),
-        Define(DefineExpr),
+        Function(DefineFunc),
+        Variable(DefineVar),
 
         Condition(
             #[rust_sitter::leaf(text = "(")] (),
@@ -168,6 +215,16 @@ pub mod grammar {
             Vec<Expr>,
             #[rust_sitter::leaf(text = ")")] (),
         ),
+    }
+
+    #[derive(Debug)]
+    pub struct Param {
+        pub ty: ReturnType,
+
+        #[rust_sitter::leaf(text = ":")]
+        _sep: (),
+
+        pub identifier: Identifier,
     }
 }
 

@@ -1,4 +1,8 @@
-use std::{collections::HashMap, path::PathBuf};
+use std::io::Write as _;
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 
 use cranelift::{
     codegen::{
@@ -28,6 +32,7 @@ pub enum CompileErr {
     IdentifierExists(String),
     DefinitionExists(Definition),
     InvalidOperation(String),
+    TypeMismatch(String),
     VariableErr(String),
     IndexOutOfRange(String),
 }
@@ -35,8 +40,6 @@ pub enum CompileErr {
 pub struct Compiler {
     flags: Flags,
     module: ObjectModule,
-    context: Context,
-    data_desc: DataDescription,
     definitions: HashMap<Symbol, Definition>,
     definition_count: usize,
     symbols: HashMap<String, Symbol>,
@@ -55,14 +58,9 @@ impl Compiler {
             .map_err(|e| CompileErr::InitErr(e.to_string()))?;
         let module = ObjectModule::new(obj_builder);
 
-        let context = Context::new();
-        let data_desc = DataDescription::new();
-
         Ok(Self {
             flags,
             module,
-            context,
-            data_desc,
             definition_count: 0,
             definitions: HashMap::new(),
             symbols: HashMap::new(),
@@ -156,14 +154,46 @@ impl Compiler {
         }
     }
 
+    fn define_func_expr(&mut self, define_expr: &DefineFunc) -> Result<Definition, CompileErr> {
+        match define_expr {
+            DefineFunc {
+                ty,
+                identifier,
+                params,
+                body,
+                ..
+            } => {
+                let returns = vec![return_type_to_ir(ty)];
+
+                self.define_func(
+                    &identifier.name,
+                    &returns,
+                    &params,
+                    body.as_ref(),
+                    Linkage::Export,
+                )
+            }
+        }
+    }
+
     fn define_func(
         &mut self,
         name: &str,
-        params: &Option<Box<Expr>>,
+        returns: &Vec<Type>,
+        params: &Vec<Param>,
         body: &Expr,
         linkage: Linkage,
     ) -> Result<Definition, CompileErr> {
         let mut sig = Signature::new(self.module.isa().default_call_conv());
+
+        for p in params {
+            let pty_ir = return_type_to_ir(&p.ty);
+            sig.params.push(AbiParam::new(pty_ir));
+        }
+        for r in returns {
+            sig.returns.push(AbiParam::new(*r));
+        }
+
         let func_id = self
             .module
             .declare_function(&name, linkage, &sig)
@@ -177,6 +207,16 @@ impl Compiler {
 
         {
             let entry_block = builder.create_block();
+
+            for p in params {
+                let ir_ty = return_type_to_ir(&p.ty);
+                let param_val = builder.append_block_param(entry_block, ir_ty);
+                let param_def = Definition::new(ir_ty, DefinedValue::Value(param_val));
+
+                self.register_def(&param_def)?;
+                self.register_symbol(&p.identifier.name, param_def.symbol())?;
+            }
+
             builder.switch_to_block(entry_block);
             builder.seal_block(entry_block);
 
@@ -188,8 +228,28 @@ impl Compiler {
             if res.val_type.is_invalid() {
                 builder.ins().return_(&[]);
             } else {
-                let zero = [builder.ins().iconst(res.val_type, 0)];
-                builder.ins().return_(&zero);
+                let resolved_values = self.resolve_values(&mut builder, &body, &res)?;
+
+                if returns.len() != resolved_values.len() {
+                    return Err(CompileErr::TypeMismatch(format!(
+                        "{name}: expected {} return types, got {}",
+                        returns.len(),
+                        resolved_values.len()
+                    )));
+                }
+                for i in 0..resolved_values.len() {
+                    if returns[i] != resolved_values[i].0 {
+                        let resolved_types: Vec<&Type> =
+                            resolved_values.iter().map(|(rt, _)| rt).collect();
+                        return Err(CompileErr::TypeMismatch(format!(
+                            "{name}: expected {returns:?} but got {resolved_types:?}"
+                        )));
+                    }
+                }
+
+                let resolved_values: Vec<Value> =
+                    resolved_values.iter().map(|(_, rv)| *rv).collect();
+                builder.ins().return_(&resolved_values);
             }
 
             builder.seal_all_blocks();
@@ -217,27 +277,27 @@ impl Compiler {
         &mut self,
         builder: &mut FunctionBuilder,
         expr: &Expr,
-        defined: &DefinedValue,
+        defined: &Definition,
         stack_index: Option<usize>,
-    ) -> Result<Option<Value>, CompileErr> {
-        match defined {
+    ) -> Result<Option<(Type, Value)>, CompileErr> {
+        match &defined.value {
             DefinedValue::None => Ok(None),
-            DefinedValue::Value(value) => Ok(Some(*value)),
+            DefinedValue::Value(value) => Ok(Some((defined.val_type, *value))),
             DefinedValue::Variable(var) => builder
                 .try_use_var(*var)
-                .map(|v| Some(v))
+                .map(|v| Some((defined.val_type, v)))
                 .map_err(|e| CompileErr::VariableErr(e.to_string())),
             DefinedValue::Data(data_id) => {
                 let pointer = self.pointer_type();
                 let data = self.module.declare_data_in_func(*data_id, builder.func);
                 let value = builder.ins().global_value(pointer, data);
-                Ok(Some(value))
+                Ok(Some((defined.val_type, value)))
             }
             DefinedValue::Function(func_id) => {
                 let pointer = self.pointer_type();
                 let func_ref = self.module.declare_func_in_func(*func_id, builder.func);
                 let value = builder.ins().func_addr(pointer, func_ref);
-                Ok(Some(value))
+                Ok(Some((defined.val_type, value)))
             }
             DefinedValue::Stack { slot, items } => {
                 let pointer = self.pointer_type();
@@ -245,17 +305,41 @@ impl Compiler {
                 if let Some(stack_index) = stack_index {
                     if let Some(item) = items.get(stack_index) {
                         let stack_value = builder.ins().stack_load(item.0, *slot, item.1);
-                        Ok(Some(stack_value))
+                        Ok(Some((item.0, stack_value)))
                     } else {
                         Err(CompileErr::IndexOutOfRange(format!("{expr:?}").to_string()))
                     }
                 } else {
                     // Resolve to ref if no stack index given
                     let stack_ref = builder.ins().stack_addr(pointer, *slot, Offset32::new(0));
-                    Ok(Some(stack_ref))
+                    Ok(Some((defined.val_type, stack_ref)))
                 }
             }
         }
+    }
+
+    fn resolve_values(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        expr: &Expr,
+        defined: &Definition,
+    ) -> Result<Vec<(Type, Value)>, CompileErr> {
+        let mut values = Vec::new();
+        match &defined.value {
+            DefinedValue::Stack { slot, items } => {
+                for (item_ty, offset) in items {
+                    let v = builder.ins().stack_load(*item_ty, *slot, *offset);
+                    values.push((*item_ty, v));
+                }
+            }
+            _ => {
+                if let Some(v) = self.resolve_value(builder, expr, defined, None)? {
+                    values.push(v);
+                }
+            }
+        }
+
+        Ok(values)
     }
 
     fn codegen_op_components(
@@ -269,14 +353,12 @@ impl Compiler {
         let mut accumulator_type: Option<Type> = None;
 
         for defined_op in operands.iter() {
-            if let Some(op_res_value) =
-                self.resolve_value(builder, expr, &defined_op.value, None)?
-            {
+            if let Some(op_res) = self.resolve_value(builder, expr, &defined_op, None)? {
                 if let Some(acc_type) = accumulator_type {
                     if let Some(new_acc_type) =
                         get_max_operable_type(op, acc_type, defined_op.val_type)
                     {
-                        accumulator_values.push(op_res_value);
+                        accumulator_values.push(op_res.1);
                         accumulator_type = Some(new_acc_type);
                     } else {
                         let defined_op_type = defined_op.val_type;
@@ -286,7 +368,7 @@ impl Compiler {
                         ));
                     }
                 } else {
-                    accumulator_values.push(op_res_value);
+                    accumulator_values.push(op_res.1);
                     accumulator_type = Some(defined_op.val_type);
                 }
             } else {
@@ -316,6 +398,8 @@ impl Compiler {
             .map(|operand| self.codegen_func(builder, operand))
             .flatten()
             .collect();
+
+        println!("op: {op:?}, operands: {defined_operands:?}");
 
         let (accumulator_type, values) =
             self.codegen_op_components(builder, expr, op, defined_operands)?;
@@ -432,18 +516,10 @@ impl Compiler {
                 self.codegen_stack(builder, expr, results.iter().collect())
             }
             Expr::Operation((), op, operand, ()) => self.codegen_op(builder, expr, op, operand),
-            Expr::Define(DefineExpr {
-                ty,
-                identifier,
-                params,
-                body,
-                ..
-            }) => match ty {
-                Some(DefineType::Function) => {
-                    self.define_func(&identifier.name, params, body, Linkage::Export)
-                }
-                None => self.define_var(builder, &identifier.name, body.as_ref()),
-            },
+            Expr::Function(def_expr) => self.define_func_expr(def_expr),
+            Expr::Variable(def_var) => {
+                self.define_var(builder, &def_var.identifier.name, def_var.body.as_ref())
+            }
             _ => Err(CompileErr::Err(
                 format!("Unhandled expression in func {func_name:?}: {expr:?}").to_string(),
             )),
@@ -464,7 +540,7 @@ impl Compiler {
         let mut offset: i32 = 0;
         let mut stored_items: Vec<(Type, Offset32)> = Vec::new();
         for item in stack_items {
-            if let Some(item_value) = self.resolve_value(builder, expr, &item.value, None)? {
+            if let Some((item_ty, item_value)) = self.resolve_value(builder, expr, &item, None)? {
                 builder
                     .ins()
                     .stack_store(item_value, slot, Offset32::new(offset));
@@ -490,26 +566,25 @@ impl Compiler {
 
     fn codegen(&mut self, expr: &Expr) -> Result<Definition, CompileErr> {
         match expr {
-            Expr::Define(DefineExpr {
-                ty: Some(DefineType::Function),
-                identifier,
-                params,
-                body,
-                ..
-            }) => {
-                self.define_func(&identifier.name, params, body.as_ref(), Linkage::Export)?;
-                Ok(Definition::default())
+            Expr::Function(def_expr) => {
+                return self.define_func_expr(def_expr);
             }
-            _ => Err(CompileErr::Err(
-                format!("Expected function declaration like (f:main ()), got: {expr:?}")
-                    .to_string(),
-            )),
+            _ => (),
         }
+
+        Err(CompileErr::Err(
+            format!("Expected function declaration like (i:main ()), got: {expr:?}").to_string(),
+        ))
     }
 }
 
-pub fn compile(expr: &Expr, output: PathBuf) -> Result<(), CompileErr> {
+pub fn compile(
+    expr: &Expr,
+    output: PathBuf,
+    execute: bool,
+) -> Result<Option<Compiler>, CompileErr> {
     let mut flag_builder = settings::builder();
+
     flag_builder
         .enable("is_pic")
         .map_err(|e| CompileErr::InitErr(e.to_string()))?;
@@ -520,14 +595,45 @@ pub fn compile(expr: &Expr, output: PathBuf) -> Result<(), CompileErr> {
 
     compiler.codegen(expr)?;
 
-    let obj = compiler.module.finish();
-    let mut file = std::fs::File::create(output).map_err(|e| CompileErr::IoErr(e.to_string()))?;
+    if execute {
+        let obj = compiler.module.finish();
 
-    obj.object
-        .write_stream(&mut file)
-        .map_err(|e| CompileErr::IoErr(e.to_string()))?;
+        // assemble
+        let obj_data = obj.emit().map_err(|e| CompileErr::IoErr(e.to_string()))?;
 
-    Ok(())
+        let mut object_path = output.clone();
+        object_path.set_extension("o");
+
+        let exec_path = output;
+        // TODO: other OS exec pathing
+
+        let mut file = std::fs::File::create(object_path.clone())
+            .map_err(|e| CompileErr::IoErr(e.to_string()))?;
+
+        file.write_all(&obj_data)
+            .map_err(|e| CompileErr::IoErr(e.to_string()))?;
+
+        link(&object_path, &exec_path).map_err(|e| CompileErr::IoErr(e.to_string()))?;
+
+        Ok(None)
+    } else {
+        Ok(Some(compiler))
+    }
+}
+
+fn link(obj_file: &Path, output: &Path) -> Result<(), std::io::Error> {
+    use std::io::{Error, ErrorKind};
+    use std::process::Command;
+
+    let status = Command::new("cc")
+        .args(&[&obj_file, Path::new("-o"), output])
+        .status()?;
+
+    if !status.success() {
+        Err(Error::new(ErrorKind::Other, "unable to link using cc"))
+    } else {
+        Ok(())
+    }
 }
 
 fn numeric_to_value(builder: &mut FunctionBuilder, numeric: &Numeric) -> Option<(Type, Value)> {
@@ -569,5 +675,12 @@ fn get_max_operable_type(op: &Operator, t1: Type, t2: Type) -> Option<Type> {
         }
     } else {
         None
+    }
+}
+
+fn return_type_to_ir(ret_type: &ReturnType) -> Type {
+    match ret_type {
+        ReturnType::Integer => types::I64,
+        ReturnType::Float => types::F64,
     }
 }
