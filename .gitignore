@@ -1,4 +1,4 @@
 /target
-./twig.o
-./twig
-./twig.exe
+twig.o
+twig
+twig.exe
