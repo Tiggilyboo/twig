@@ -26,6 +26,11 @@ use parser::*;
 mod definitions;
 use definitions::*;
 
+mod operation;
+use operation::*;
+
+const ENTRY_FUNCTION_NAME: &'static str = "main";
+
 #[derive(Debug)]
 pub enum CompileErr {
     Err(String),
@@ -137,9 +142,9 @@ impl Compiler {
         value: &Expr,
     ) -> Result<Definition, CompileErr> {
         if self.is_defined(name) {
-            return Err(CompileErr::Err(
-                format!("Identifier already defined: {name}").to_string(),
-            ));
+            return Err(CompileErr::Err(format!(
+                "Identifier already defined: {name}"
+            )));
         }
 
         match value {
@@ -165,9 +170,9 @@ impl Compiler {
 
                 Ok(def)
             }
-            _ => Err(CompileErr::Err(
-                format!("Unhandled variable value type: {value:?}").to_string(),
-            )),
+            _ => Err(CompileErr::Err(format!(
+                "Unhandled variable value type: {value:?}"
+            ))),
         }
     }
 
@@ -315,7 +320,7 @@ impl Compiler {
                         let stack_value = builder.ins().stack_load(item.0, *slot, item.1);
                         Ok(Some((item.0, stack_value)))
                     } else {
-                        Err(CompileErr::IndexOutOfRange(format!("{expr:?}").to_string()))
+                        Err(CompileErr::IndexOutOfRange(format!("{expr:?}")))
                     }
                 } else {
                     // Resolve to ref if no stack index given
@@ -396,78 +401,15 @@ impl Compiler {
             self.codegen_op_components(builder, expr, op, defined_operands)?;
 
         let mut accumulator = *values.iter().nth(0).unwrap();
+        let others = values.iter().skip(1);
 
         if accumulator_type.is_int() {
-            match op {
-                Operator::Add => {
-                    for val in values.iter().skip(1) {
-                        accumulator = builder.ins().iadd(accumulator, *val);
-                    }
-                }
-                Operator::Sub => {
-                    for val in values.iter().skip(1) {
-                        accumulator = builder.ins().isub(accumulator, *val);
-                    }
-                }
-                Operator::Mul => {
-                    for val in values.iter().skip(1) {
-                        accumulator = builder.ins().imul(accumulator, *val);
-                    }
-                }
-                Operator::Div => {
-                    // DIV 0
-                    for val in values.iter().skip(1) {
-                        accumulator = builder.ins().sdiv(accumulator, *val);
-                    }
-                }
-                Operator::Mod => {
-                    for val in values.iter().skip(1) {
-                        accumulator = builder.ins().srem(accumulator, *val);
-                    }
-                }
-                _ => {
-                    return Err(CompileErr::Err(format!(
-                        "Unhandled operator for {accumulator_type}: {op:?}"
-                    )))
-                }
-            }
+            accumulator = IOpAccumulator::from(op).value_func(builder, accumulator, others)?;
         } else if accumulator_type.is_float() {
-            match op {
-                Operator::Add => {
-                    for val in values.iter() {
-                        accumulator = builder.ins().fadd(accumulator, *val);
-                    }
-                }
-                Operator::Sub => {
-                    for val in values.iter() {
-                        accumulator = builder.ins().fsub(accumulator, *val);
-                    }
-                }
-                Operator::Mul => {
-                    for val in values.iter() {
-                        accumulator = builder.ins().fmul(accumulator, *val);
-                    }
-                }
-                Operator::Div => {
-                    // DIV 0
-                    for val in values.iter() {
-                        accumulator = builder.ins().fdiv(accumulator, *val);
-                    }
-                }
-                Operator::Mod => {
-                    for val in values.iter() {
-                        accumulator = builder.ins().srem(accumulator, *val);
-                    }
-                }
-                _ => {
-                    return Err(CompileErr::Err(format!(
-                        "Unhandled operator for {accumulator_type}: {op:?}"
-                    )))
-                }
-            }
+            accumulator = FOpAccumulator::from(op).value_func(builder, accumulator, others)?;
         } else {
-            return Err(CompileErr::Err(format!(
-                "Unhandled type {accumulator_type} for operation: {op:?}"
+            return Err(CompileErr::InvalidOperation(format!(
+                "{op:?} unable to operate on {accumulator_type}"
             )));
         }
 
@@ -525,9 +467,9 @@ impl Compiler {
             Expr::Variable(def_var) => {
                 self.define_var(builder, &def_var.identifier.name, def_var.body.as_ref())
             }
-            _ => Err(CompileErr::Err(
-                format!("Unhandled expression in func {func_name:?}: {expr:?}").to_string(),
-            )),
+            _ => Err(CompileErr::Err(format!(
+                "Unhandled expression in func {func_name:?}: {expr:?}"
+            ))),
         }
     }
 
@@ -612,18 +554,17 @@ impl Compiler {
     fn codegen(&mut self, expr: &Expr) -> Result<Definition, CompileErr> {
         match expr {
             Expr::Function(def_expr) => {
-                if def_expr.identifier.name.to_lowercase() != "main" {
-                    Err(CompileErr::Err(
-                        "Expected function declaration for entry point \"main\"".to_string(),
-                    ))
+                if def_expr.identifier.name.to_lowercase() != ENTRY_FUNCTION_NAME {
+                    Err(CompileErr::Err(format!(
+                        "Expected function declaration for entry point \"{ENTRY_FUNCTION_NAME}\""
+                    )))
                 } else {
                     self.define_func_expr(def_expr)
                 }
             }
-            _ => Err(CompileErr::Err(
-                format!("Expected function declaration like (i:main ()), got: {expr:?}")
-                    .to_string(),
-            )),
+            _ => Err(CompileErr::Err(format!(
+                "Expected function declaration like (i:main ()), got: {expr:?}"
+            ))),
         }
     }
 }

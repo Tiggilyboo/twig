@@ -43,6 +43,8 @@ pub mod grammar {
         And,
         #[rust_sitter::leaf(text = "|")]
         Or,
+        #[rust_sitter::leaf(text = "@")]
+        At,
     }
 
     pub struct Identifier {
@@ -132,13 +134,7 @@ pub mod grammar {
 
         pub identifier: Identifier,
 
-        #[rust_sitter::leaf(text = "(")]
-        _p_start: (),
-
         pub params: Vec<Param>,
-
-        #[rust_sitter::leaf(text = ")")]
-        _p_end: (),
 
         pub body: Box<Expr>,
 
@@ -226,8 +222,13 @@ pub mod grammar {
         ),
     }
 
+    // (i:main, i:argc, (s):argv ( ...
+    //        ^-------^---------
     #[derive(Debug)]
     pub struct Param {
+        #[rust_sitter::leaf(text = ",")]
+        _prefix: (),
+
         pub ty: ReturnType,
 
         #[rust_sitter::leaf(text = ":")]
