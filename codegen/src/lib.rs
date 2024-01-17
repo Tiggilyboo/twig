@@ -8,6 +8,7 @@ use cranelift_codegen::ir::{
     condcodes, AbiParam, InstBuilder, Signature, StackSlotData, StackSlotKind,
 };
 use cranelift_codegen::settings::Flags;
+use cranelift_codegen::CompileError;
 use cranelift_codegen::{
     entity::EntityRef,
     ir::types,
@@ -19,8 +20,8 @@ use cranelift_codegen::{
     verify_function,
 };
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
-use cranelift_module::{Linkage, Module, ModuleError};
-use cranelift_object::{ObjectBuilder, ObjectModule};
+use cranelift_jit::{JITBuilder, JITModule};
+use cranelift_module::{FuncOrDataId, Linkage, Module, ModuleError};
 use parser::*;
 
 mod definitions;
@@ -52,7 +53,7 @@ pub enum CompileErr {
 
 pub struct Compiler {
     flags: Flags,
-    module: ObjectModule,
+    module: JITModule,
     definitions: HashMap<Symbol, Definition>,
     definition_count: usize,
     symbols: HashMap<String, Symbol>,
@@ -62,15 +63,14 @@ pub struct Compiler {
 }
 
 impl Compiler {
-    pub fn new(name: &str, flags: Flags) -> Result<Self, CompileErr> {
+    pub fn new(flags: Flags) -> Result<Self, CompileErr> {
         let isa_builder =
             cranelift_native::builder().map_err(|e| CompileErr::InitErr(e.to_string()))?;
         let isa = isa_builder
             .finish(flags.clone())
             .map_err(|e| CompileErr::InitErr(e.to_string()))?;
-        let obj_builder = ObjectBuilder::new(isa, name, cranelift_module::default_libcall_names())
-            .map_err(|e| CompileErr::InitErr(e.to_string()))?;
-        let module = ObjectModule::new(obj_builder);
+        let obj_builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
+        let module = JITModule::new(obj_builder);
         let pointer_ty = module.target_config().pointer_type();
 
         Ok(Self {
@@ -569,35 +569,52 @@ impl Compiler {
     }
 }
 
-pub fn compile(
-    expr: &Expr,
-    output: PathBuf,
-    execute: bool,
-) -> Result<Option<Compiler>, CompileErr> {
+pub fn compile(expr: &Expr, execute: bool) -> Result<Option<*const u8>, CompileErr> {
     let mut flag_builder = settings::builder();
 
     flag_builder
         .enable("is_pic")
         .map_err(|e| CompileErr::InitErr(e.to_string()))?;
 
+    flag_builder
+        .set("use_colocated_libcalls", "false")
+        .map_err(|e| CompileErr::Err(e.to_string()))?;
+
     let flags = settings::Flags::new(flag_builder);
 
-    let mut compiler = Compiler::new("entry", flags)?;
+    let mut compiler = Compiler::new(flags)?;
 
     compiler.codegen(expr)?;
 
     if execute {
-        let obj = compiler.module.finish();
+        // FOR AOT: let obj = compiler.module.finish();
+        // FOR JIT:
+        compiler
+            .module
+            .finalize_definitions()
+            .map_err(|e| CompileErr::ModuleErr(e))?;
+
+        // Find entrypoint
+        let main_fn_id = match compiler.module.get_name(ENTRY_FUNCTION_NAME) {
+            Some(FuncOrDataId::Func(func_id)) => Some(func_id),
+            _ => None,
+        };
+        if main_fn_id.is_none() {
+            return Err(CompileErr::Err(
+                "Expected main function to be defined".into(),
+            ));
+        }
+
+        let code = compiler
+            .module
+            .get_finalized_function(main_fn_id.unwrap().clone());
 
         // assemble
-        let obj_data = obj.emit().map_err(|e| CompileErr::IoErr(e.to_string()))?;
-
+        /*let obj_data = obj.emit().map_err(|e| CompileErr::IoErr(e.to_string()))?;
         let mut object_path = output.clone();
         object_path.set_extension("o");
 
         let exec_path = output;
-        // TODO: other OS exec pathing
-
         let mut file = std::fs::File::create(object_path.clone())
             .map_err(|e| CompileErr::IoErr(e.to_string()))?;
 
@@ -605,10 +622,11 @@ pub fn compile(
             .map_err(|e| CompileErr::IoErr(e.to_string()))?;
 
         link(&object_path, &exec_path).map_err(|e| CompileErr::IoErr(e.to_string()))?;
+        */
 
-        Ok(None)
+        Ok(Some(code))
     } else {
-        Ok(Some(compiler))
+        Ok(None)
     }
 }
 
