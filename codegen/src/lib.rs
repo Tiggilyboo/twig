@@ -1,14 +1,9 @@
-use std::io::Write as _;
-use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
-};
+use std::{collections::HashMap, path::Path};
 
 use cranelift_codegen::ir::{
     condcodes, AbiParam, InstBuilder, Signature, StackSlotData, StackSlotKind,
 };
 use cranelift_codegen::settings::Flags;
-use cranelift_codegen::CompileError;
 use cranelift_codegen::{
     entity::EntityRef,
     ir::types,
@@ -21,7 +16,7 @@ use cranelift_codegen::{
 };
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_jit::{JITBuilder, JITModule};
-use cranelift_module::{FuncOrDataId, Linkage, Module, ModuleError};
+use cranelift_module::{DataDescription, FuncOrDataId, Linkage, Module, ModuleError};
 use parser::*;
 
 mod definitions;
@@ -29,6 +24,8 @@ use definitions::*;
 
 mod operation;
 use operation::*;
+
+mod builtins;
 
 const ENTRY_FUNCTION_NAME: &'static str = "main";
 
@@ -49,6 +46,7 @@ pub enum CompileErr {
     TypeMismatch(String),
     VariableErr(String),
     IndexOutOfRange(String),
+    InvalidFunctionSignature(String),
 }
 
 pub struct Compiler {
@@ -73,6 +71,9 @@ impl Compiler {
         let module = JITModule::new(obj_builder);
         let pointer_ty = module.target_config().pointer_type();
 
+        // Register builtins for running defined functions
+        // TODO
+
         Ok(Self {
             flags,
             module,
@@ -85,7 +86,42 @@ impl Compiler {
         })
     }
 
-    fn def_by_name(&self, name: &str) -> Option<&Definition> {
+    fn define_data(
+        &mut self,
+        identifier: &str,
+        linkage: Linkage,
+        mutable: bool,
+        data: Vec<u8>,
+    ) -> Result<Definition, CompileErr> {
+        if self.is_defined(identifier) {
+            return Err(CompileErr::IdentifierExists(format!(
+                "identifier '{identifier}' already exists"
+            )));
+        }
+        println!("Defining data: {identifier}");
+        let data_id = self
+            .module
+            .declare_data(identifier, linkage, mutable, false)
+            .map_err(|e| CompileErr::ModuleErr(e))?;
+
+        let mut data_desc = DataDescription::new();
+        data_desc.define(data.into_boxed_slice());
+
+        self.module
+            .define_data(data_id, &data_desc)
+            .map_err(|e| CompileErr::ModuleErr(e))?;
+
+        let def = Definition::new(self.pointer_ty, DefinedValue::Data(data_id));
+        if self.try_register_def(&def) {
+            self.register_symbol(identifier, def.symbol())?;
+        } else {
+            return Err(CompileErr::DefinitionExists(def));
+        }
+
+        Ok(def)
+    }
+
+    fn get_def_by_name(&self, name: &str) -> Option<&Definition> {
         if let Some(index) = self.symbols.get(name) {
             if let Some(def) = self.definitions.get(index) {
                 println!("found {name} def: {def:?}");
@@ -149,7 +185,7 @@ impl Compiler {
 
         match value {
             Expr::Identifier(identifier) => {
-                let ident_def = self.def_by_name(&identifier.name).cloned();
+                let ident_def = self.get_def_by_name(&identifier.name).cloned();
 
                 if let Some(ident_def) = ident_def {
                     self.register_symbol(&identifier.name, ident_def.symbol())?;
@@ -169,6 +205,9 @@ impl Compiler {
                 self.register_symbol(name, def.symbol())?;
 
                 Ok(def)
+            }
+            Expr::String(string) => {
+                self.define_data(name, Linkage::Hidden, false, string.clone().into_bytes())
             }
             _ => Err(CompileErr::Err(format!(
                 "Unhandled variable value type: {value:?}"
@@ -436,10 +475,9 @@ impl Compiler {
         builder: &mut FunctionBuilder,
         expr: &Expr,
     ) -> Result<Definition, CompileErr> {
-        let func_name = builder.func.name.get_user();
         match expr {
             Expr::Identifier(identifier) => {
-                if let Some(defined) = self.def_by_name(&identifier.name) {
+                if let Some(defined) = self.get_def_by_name(&identifier.name) {
                     Ok(defined.clone())
                 } else {
                     Err(CompileErr::UndefinedIdentifier(identifier.name.to_string()))
@@ -459,8 +497,127 @@ impl Compiler {
                 self.codegen_cond(builder, expr, comparator, results.iter().collect())
             }
             Expr::List((), items, ()) => {
-                let results = self.codegen_func_vec(builder, &items.iter().collect())?;
-                self.codegen_stack(builder, expr, results.iter().collect())
+                // Evaluate remaining parameters to call to function
+                let item_values = self.codegen_func_vec(builder, &items.iter().collect())?;
+
+                // Extract identifier of function (if any)
+                let func_data_id = if let Some(first_item) = items.first() {
+                    match first_item {
+                        Expr::Identifier(Identifier { name }) => {
+                            if let Some(def_symbol) = self.symbols.get(name) {
+                                if let Some(def) = self.definitions.get(def_symbol) {
+                                    match def.value {
+                                        DefinedValue::Function(func_id) => {
+                                            Some(FuncOrDataId::Func(func_id))
+                                        }
+                                        DefinedValue::Data(data_id) => {
+                                            Some(FuncOrDataId::Data(data_id))
+                                        }
+                                        _ => None,
+                                    }
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+
+                match func_data_id {
+                    Some(FuncOrDataId::Func(func_id)) => {
+                        let (func_name, func_sig_params, func_ret) = {
+                            let func_decl = self.module.declarations().get_function_decl(func_id);
+                            let func_sig_params = func_decl
+                                .signature
+                                .params
+                                .iter()
+                                .map(|p| p.value_type)
+                                .collect::<Vec<Type>>();
+                            let func_ret = func_decl
+                                .signature
+                                .returns
+                                .iter()
+                                .map(|p| p.value_type)
+                                .collect::<Vec<Type>>();
+                            let func_name = func_decl.name.clone().unwrap_or("anonymous".into());
+
+                            (func_name, func_sig_params, func_ret)
+                        };
+
+                        // TODO: Abstract validation of signature to call:
+                        // Signature does not match
+                        if func_sig_params.len() != items.len() - 1 {
+                            return Err(CompileErr::InvalidFunctionSignature(format!(
+                                "function {} requires {} parameters, but only {} were passed",
+                                func_name,
+                                func_sig_params.len(),
+                                items.len() - 1
+                            )));
+                        }
+
+                        let mut func_params = vec![];
+
+                        // Validate parameters
+                        for (index, sig_param) in func_sig_params.iter().enumerate() {
+                            if let Some(item_definition) = item_values.get(index) {
+                                if item_definition.val_type != *sig_param {
+                                    return Err(CompileErr::InvalidFunctionSignature(format!(
+                                        "function {} argument {} type mismatch {:?} != {:?}",
+                                        func_name, index, sig_param, item_definition.val_type
+                                    )));
+                                }
+
+                                // Try to resolve the definition of the parameter
+                                if let Some(param_expr) = items.get(index) {
+                                    let resolved_value = self.resolve_value(builder, param_expr, item_definition, None)
+                                        .map_err(|e| CompileErr::InvalidFunctionSignature(format!("function {func_name} parameter {index} from {param_expr:?}: {e:?}")))?;
+
+                                    if let Some((_param_type, param_value)) = resolved_value {
+                                        func_params.push(param_value);
+                                    } else {
+                                        return Err(CompileErr::InvalidFunctionSignature(format!(
+                                            "function {func_name} parameter {index} "
+                                        )));
+                                    }
+                                } else {
+                                    return Err(CompileErr::InvalidFunctionSignature(format!("function {func_name} parameter {index} could not resolve parsed expression")));
+                                }
+                            } else {
+                                return Err(CompileErr::InvalidFunctionSignature(format!(
+                                    "function {} argument {} of type {:?} missing",
+                                    func_name, index, sig_param
+                                )));
+                            }
+                        }
+
+                        let func_ref = self.module.declare_func_in_func(func_id, builder.func);
+                        let call = builder.ins().call(func_ref, func_params.as_slice());
+
+                        let call_ret = builder.inst_results(call);
+                        if call_ret.is_empty() {
+                            return Ok(Definition::null());
+                        } else {
+                            let mut ret_definitions = Vec::new();
+                            for (ret_val, ret_param) in call_ret.iter().zip(func_ret) {
+                                ret_definitions.push(Definition::new(
+                                    ret_param.clone(),
+                                    DefinedValue::Value(ret_val.clone()),
+                                ));
+                            }
+
+                            self.codegen_stack(builder, expr, ret_definitions.iter().collect())
+                        }
+                    }
+                    Some(FuncOrDataId::Data(data_id)) => {
+                        unimplemented!()
+                    }
+                    None => self.codegen_stack(builder, expr, item_values.iter().collect()),
+                }
             }
             Expr::Operation((), op, operand, ()) => self.codegen_op(builder, expr, op, operand),
             Expr::Function(def_expr) => self.define_func_expr(def_expr),
@@ -468,7 +625,8 @@ impl Compiler {
                 self.define_var(builder, &def_var.identifier.name, def_var.body.as_ref())
             }
             _ => Err(CompileErr::Err(format!(
-                "Unhandled expression in func {func_name:?}: {expr:?}"
+                "Unhandled expression in func {:?}: {:?}",
+                builder.func.name, expr
             ))),
         }
     }
@@ -519,25 +677,33 @@ impl Compiler {
         expr: &Expr,
         stack_items: Vec<&Definition>,
     ) -> Result<Definition, CompileErr> {
-        let data_bits: u32 = stack_items.iter().map(|i| i.bits()).sum();
+        // Resolve all values before defining the stack
+        let mut stack_values = Vec::new();
+        for item in stack_items {
+            if let Some((item_ty, item_value)) = self.resolve_value(builder, expr, &item, None)? {
+                stack_values.push((item_ty, item_value));
+            } else {
+                return Err(CompileErr::UndefinedValue(item.clone()));
+            }
+        }
+
+        // All values evaluated, now we can define the stack and it's elements
+
+        let data_bits: u32 = stack_values.iter().map(|i| i.0.bits()).sum();
         let data_size = data_bits + 7 / 8;
         let data = StackSlotData::new(StackSlotKind::ExplicitSlot, data_size);
         let slot = builder.create_sized_stack_slot(data);
 
         let mut offset: i32 = 0;
         let mut stored_items: Vec<(Type, Offset32)> = Vec::new();
-        for item in stack_items {
-            if let Some((_item_ty, item_value)) = self.resolve_value(builder, expr, &item, None)? {
-                builder
-                    .ins()
-                    .stack_store(item_value, slot, Offset32::new(offset));
+        for (item_ty, item_value) in stack_values {
+            builder
+                .ins()
+                .stack_store(item_value, slot, Offset32::new(offset));
 
-                stored_items.push((item.val_type, Offset32::new(offset)));
+            stored_items.push((item_ty, Offset32::new(offset)));
 
-                offset += item.bytes() as i32;
-            } else {
-                return Err(CompileErr::UndefinedValue(item.clone()));
-            }
+            offset += item_ty.bytes() as i32;
         }
 
         let def = Definition::new(
