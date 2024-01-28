@@ -4,9 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-cranelift-frontend = "0.103"
-cranelift-codegen = { version = "0.103", features = ["default", "all-arch"] }
-cranelift-module = "0.103"
-cranelift-native = "0.103"
-cranelift-jit = "0.103"
+cranelift-frontend = "0.104"
+cranelift-codegen = { version = "0.104", features = ["default", "all-arch"] }
+cranelift-module = "0.104"
+cranelift-native = "0.104"
+cranelift-jit = "0.104"
 parser = { path = "../parser" }

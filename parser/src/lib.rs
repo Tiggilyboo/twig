@@ -9,7 +9,7 @@ pub mod grammar {
         _whitespace: (),
     }
 
-    #[derive(Debug)]
+    #[derive(Debug, PartialEq, Eq)]
     pub enum Comparator {
         #[rust_sitter::leaf(text = "!=")]
         NotEq,
@@ -23,6 +23,23 @@ pub mod grammar {
         Greater,
         #[rust_sitter::leaf(text = "<")]
         Less,
+        #[rust_sitter::leaf(text = "_")]
+        Default,
+    }
+
+    /*
+        (>= value1 (. "Value is greater or equal to value1"))
+    */
+    #[derive(Debug)]
+    pub struct Condition {
+        #[rust_sitter::leaf(text = "(")]
+        _open: (),
+
+        pub cmp: Comparator,
+        pub operands: Vec<Expr>,
+
+        #[rust_sitter::leaf(text = ")")]
+        _close: (),
     }
 
     #[derive(Debug)]
@@ -123,6 +140,9 @@ pub mod grammar {
         ListInteger,
     }
 
+    /*
+        (i:main 123)
+    */
     pub struct DefineFunc {
         #[rust_sitter::leaf(text = "(")]
         _start: (),
@@ -142,6 +162,9 @@ pub mod grammar {
         _end: (),
     }
 
+    /*
+        (:variable 123)
+    */
     pub struct DefineVar {
         #[rust_sitter::prec(1)]
         #[rust_sitter::leaf(text = "(")]
@@ -201,12 +224,24 @@ pub mod grammar {
         Function(DefineFunc),
         Variable(DefineVar),
 
-        Condition(
+        /*
+            (:value 123)
+            (? value
+              (< 0 (. "Value is less than 0"))
+              (= 1 (. "Value is 1"))
+              (_ (. "Value is 0 or greater than 1")))
+        */
+        Switch(
             #[rust_sitter::leaf(text = "(")] (),
-            Comparator,
-            Vec<Expr>,
+            #[rust_sitter::leaf(text = "?")] (),
+            Box<Expr>,
+            Vec<Condition>,
             #[rust_sitter::leaf(text = ")")] (),
         ),
+
+        /*
+            (+ 1 3 8)
+        */
         Operation(
             #[rust_sitter::leaf(text = "(")] (),
             Operator,

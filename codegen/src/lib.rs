@@ -1,7 +1,8 @@
 use std::{collections::HashMap, path::Path};
 
 use cranelift_codegen::ir::{
-    condcodes, AbiParam, InstBuilder, Signature, StackSlotData, StackSlotKind,
+    condcodes, AbiParam, Block, BlockCall, InstBuilder, JumpTableData, Signature, StackSlotData,
+    StackSlotKind, ValueList, ValueListPool,
 };
 use cranelift_codegen::settings::Flags;
 use cranelift_codegen::{
@@ -14,7 +15,7 @@ use cranelift_codegen::{
     verifier::VerifierErrors,
     verify_function,
 };
-use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
+use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Switch, Variable};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{DataDescription, FuncOrDataId, Linkage, Module, ModuleError};
 use parser::*;
@@ -492,9 +493,106 @@ impl Compiler {
                     )))
                 }
             }
-            Expr::Condition((), comparator, items, ()) => {
-                let results = self.codegen_func_vec(builder, &items.iter().collect())?;
-                self.codegen_cond(builder, expr, comparator, results.iter().collect())
+            Expr::Switch((), (), switch_expr, cases, ()) => {
+                let cond_def = self.codegen_func(builder, switch_expr.as_ref())?;
+                let cond_val = self.resolve_value(builder, switch_expr, &cond_def, None)?;
+                if cond_val.is_none() {
+                    return Err(CompileErr::InvalidCondition(format!(
+                        "Switch subject not defined: {switch_expr:?}"
+                    )));
+                }
+                let (cond_ty, _cond_val) = cond_val.unwrap();
+                let merge_block = builder.create_block();
+                let default_block = builder.create_block();
+                let mut default_filled = false;
+
+                builder.append_block_param(merge_block, cond_ty);
+
+                for case in cases {
+                    if case.cmp == Comparator::Default {
+                        // Default case should only specify a single operand
+                        if case.operands.len() != 1 {
+                            return Err(CompileErr::InvalidCondition(
+                                "Multi condition switches not currently implemented".into(),
+                            ));
+                        }
+                        if default_filled {
+                            return Err(CompileErr::InvalidCondition(format!(
+                                "Switch may only have one default case: {switch_expr:?}"
+                            )));
+                        }
+
+                        // Set up default block
+                        if let Some(default_expr) = case.operands.first() {
+                            builder.switch_to_block(default_block);
+                            builder.seal_block(default_block);
+
+                            let else_def = self.codegen_func(builder, default_expr)?;
+                            let else_val =
+                                self.resolve_value(builder, default_expr, &else_def, None)?;
+                            let merge_block_inputs = if let Some((_, else_value)) = else_val {
+                                vec![else_value]
+                            } else {
+                                vec![]
+                            };
+
+                            // Jump to merge block pass it the else return value
+                            builder.ins().jump(merge_block, &merge_block_inputs);
+                        } else {
+                            return Err(CompileErr::InvalidCondition(format!(
+                                "Switch default case must specify only one expression: {switch_expr:?}")));
+                        }
+
+                        default_filled = true;
+                    }
+                    // case defines operands to compare against
+                    // Should define at least 2
+                    else if case.operands.len() != 2 {
+                        return Err(CompileErr::InvalidCondition(
+                            "Multi condition switches not currently implemented".into(),
+                        ));
+                    } else {
+                        let case_block = builder.create_block();
+                        let operand = &case.operands[0];
+                        let operand_def = self.codegen_func(builder, &operand)?;
+
+                        let cmp_val = self.codegen_cond(
+                            builder,
+                            &switch_expr,
+                            &case.cmp,
+                            vec![&cond_def, &operand_def],
+                        )?;
+
+                        builder
+                            .ins()
+                            .brif(cmp_val, case_block, &[], default_block, &[]);
+
+                        // Fill case block
+                        builder.switch_to_block(case_block);
+                        builder.seal_block(case_block);
+                        let case_expr = &case.operands[1];
+
+                        let case_def = self.codegen_func(builder, &case_expr)?;
+                        let case_value =
+                            self.resolve_value(builder, &case_expr, &case_def, None)?;
+                        let merge_block_inputs = if let Some((_case_ty, case_value)) = case_value {
+                            vec![case_value]
+                        } else {
+                            vec![]
+                        };
+
+                        // jump to merge block with case_value
+                        builder.ins().jump(merge_block, &merge_block_inputs);
+                    }
+                }
+
+                builder.switch_to_block(merge_block);
+                builder.seal_block(merge_block);
+
+                let switch_value = builder.block_params(merge_block)[0];
+                let switch_def = Definition::new(cond_ty, DefinedValue::Value(switch_value));
+
+                Ok(switch_def)
             }
             Expr::List((), items, ()) => {
                 // Evaluate remaining parameters to call to function
@@ -637,7 +735,7 @@ impl Compiler {
         expr: &Expr,
         comparator: &Comparator,
         operands: Vec<&Definition>,
-    ) -> Result<Definition, CompileErr> {
+    ) -> Result<Value, CompileErr> {
         let mut operand_ir = Vec::new();
         for operand in operands {
             if let Some(pair) = self.resolve_value(builder, expr, &operand, None)? {
@@ -652,15 +750,24 @@ impl Compiler {
             return Err(CompileErr::InvalidCondition(format!(
                 "condition {comparator:?} for {expr:?} has invalid operands"
             )));
+        } else if comparator == &Comparator::Default {
+            // Fallthrough / default condition, always return non-zero (1)
+            cmp = builder.ins().iconst(types::I64, 1);
         } else if ty.is_int() {
-            let cc = condcode_int(comparator);
-            for value in operand_values.iter().skip(1) {
-                cmp = builder.ins().icmp(cc, cmp, *value);
+            if let Some(cc) = condcode_int(comparator) {
+                for value in operand_values.iter().skip(1) {
+                    cmp = builder.ins().icmp(cc, cmp, *value);
+                }
+            } else {
+                unreachable!()
             }
         } else if ty.is_float() {
-            let cc = condcode_float(comparator);
-            for value in operand_values.iter().skip(1) {
-                cmp = builder.ins().fcmp(cc, cmp, *value);
+            if let Some(cc) = condcode_float(comparator) {
+                for value in operand_values.iter().skip(1) {
+                    cmp = builder.ins().fcmp(cc, cmp, *value);
+                }
+            } else {
+                unreachable!()
             }
         } else {
             return Err(CompileErr::InvalidCondition(format!(
@@ -668,7 +775,7 @@ impl Compiler {
             )));
         }
 
-        Ok(Definition::new(ty, DefinedValue::Value(cmp)))
+        Ok(cmp)
     }
 
     fn codegen_stack(
@@ -832,29 +939,31 @@ fn numeric_to_value(builder: &mut FunctionBuilder, numeric: &Numeric) -> Option<
     None
 }
 
-fn condcode_int(comparator: &Comparator) -> condcodes::IntCC {
+fn condcode_int(comparator: &Comparator) -> Option<condcodes::IntCC> {
     use condcodes::*;
 
     match comparator {
-        Comparator::Eq => IntCC::Equal,
-        Comparator::NotEq => IntCC::NotEqual,
-        Comparator::Less => IntCC::SignedLessThan,
-        Comparator::LessEq => IntCC::SignedLessThanOrEqual,
-        Comparator::Greater => IntCC::SignedGreaterThan,
-        Comparator::GreaterEq => IntCC::SignedGreaterThanOrEqual,
+        Comparator::Eq => Some(IntCC::Equal),
+        Comparator::NotEq => Some(IntCC::NotEqual),
+        Comparator::Less => Some(IntCC::SignedLessThan),
+        Comparator::LessEq => Some(IntCC::SignedLessThanOrEqual),
+        Comparator::Greater => Some(IntCC::SignedGreaterThan),
+        Comparator::GreaterEq => Some(IntCC::SignedGreaterThanOrEqual),
+        Comparator::Default => None,
     }
 }
 
-fn condcode_float(comparator: &Comparator) -> condcodes::FloatCC {
+fn condcode_float(comparator: &Comparator) -> Option<condcodes::FloatCC> {
     use condcodes::*;
 
     return match comparator {
-        Comparator::Eq => FloatCC::Equal,
-        Comparator::NotEq => FloatCC::NotEqual,
-        Comparator::Less => FloatCC::LessThan,
-        Comparator::LessEq => FloatCC::LessThanOrEqual,
-        Comparator::Greater => FloatCC::GreaterThan,
-        Comparator::GreaterEq => FloatCC::GreaterThanOrEqual,
+        Comparator::Eq => Some(FloatCC::Equal),
+        Comparator::NotEq => Some(FloatCC::NotEqual),
+        Comparator::Less => Some(FloatCC::LessThan),
+        Comparator::LessEq => Some(FloatCC::LessThanOrEqual),
+        Comparator::Greater => Some(FloatCC::GreaterThan),
+        Comparator::GreaterEq => Some(FloatCC::GreaterThanOrEqual),
+        Comparator::Default => None,
     };
 }
 
