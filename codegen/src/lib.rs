@@ -1,8 +1,7 @@
 use std::{collections::HashMap, path::Path};
 
 use cranelift_codegen::ir::{
-    condcodes, AbiParam, Block, BlockCall, InstBuilder, JumpTableData, Signature, StackSlotData,
-    StackSlotKind, ValueList, ValueListPool,
+    condcodes, AbiParam, InstBuilder, Signature, StackSlotData, StackSlotKind,
 };
 use cranelift_codegen::settings::Flags;
 use cranelift_codegen::{
@@ -15,7 +14,7 @@ use cranelift_codegen::{
     verifier::VerifierErrors,
     verify_function,
 };
-use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Switch, Variable};
+use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{DataDescription, FuncOrDataId, Linkage, Module, ModuleError};
 use parser::*;
@@ -68,19 +67,39 @@ impl Compiler {
         let isa = isa_builder
             .finish(flags.clone())
             .map_err(|e| CompileErr::InitErr(e.to_string()))?;
-        let obj_builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
-        let module = JITModule::new(obj_builder);
-        let pointer_ty = module.target_config().pointer_type();
+        let mut module_builder =
+            JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
 
         // Register builtins for running defined functions
-        // TODO
+        module_builder.symbol("print", builtins::print as *const u8);
+
+        let mut module = JITModule::new(module_builder);
+        let pointer_ty = module.target_config().pointer_type();
+
+        let mut symbols = HashMap::new();
+        let mut definitions = HashMap::new();
+
+        // PRINT
+        {
+            let mut sig = module.make_signature();
+            sig.params.push(AbiParam::new(pointer_ty));
+
+            let func_id = module
+                .declare_function("print", Linkage::Import, &sig)
+                .map_err(|e| CompileErr::ModuleErr(e))?;
+
+            let symbol = Symbol::from(func_id.index());
+            let def = Definition::new(pointer_ty, DefinedValue::Function(func_id));
+            symbols.insert("print".into(), symbol);
+            definitions.insert(symbol, def);
+        }
 
         Ok(Self {
             flags,
             module,
             definition_count: 0,
-            definitions: HashMap::new(),
-            symbols: HashMap::new(),
+            definitions,
+            symbols,
             sig_count: 0,
             debug: true,
             pointer_ty,
@@ -311,6 +330,7 @@ impl Compiler {
 
             builder.seal_all_blocks();
             if self.debug {
+                println!("> {}", builder.func.name);
                 println!("{}", builder.func);
             }
             builder.finalize();
@@ -616,8 +636,11 @@ impl Compiler {
                                 } else {
                                     None
                                 }
+                            // Check if the symbol is defined in the module
+                            } else if let Some(func_or_data_id) = self.module.get_name(name) {
+                                Some(func_or_data_id)
                             } else {
-                                None
+                                return Err(CompileErr::UndefinedIdentifier(name.to_string()));
                             }
                         }
                         _ => None,
@@ -903,6 +926,8 @@ pub fn compile(expr: &Expr, execute: bool) -> Result<Option<*const u8>, CompileE
     }
 }
 
+// for aot object compilation
+#[allow(unused)]
 fn link(obj_file: &Path, output: &Path) -> Result<(), std::io::Error> {
     use std::io::{Error, ErrorKind};
     use std::process::Command;
@@ -916,6 +941,11 @@ fn link(obj_file: &Path, output: &Path) -> Result<(), std::io::Error> {
     } else {
         Ok(())
     }
+}
+
+pub unsafe fn run_code<I1, I2, O>(code_ptr: *const u8, input1: I1, input2: I2) -> O {
+    let code_fn = std::mem::transmute::<_, fn(I1, I2) -> O>(code_ptr);
+    code_fn(input1, input2)
 }
 
 fn numeric_to_value(builder: &mut FunctionBuilder, numeric: &Numeric) -> Option<(Type, Value)> {
