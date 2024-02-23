@@ -1,4 +1,3 @@
-use cranelift_codegen::entity::EntityRef;
 use cranelift_codegen::ir::types;
 use cranelift_codegen::ir::{immediates::Offset32, StackSlot, Type, Value};
 use cranelift_frontend::Variable;
@@ -15,16 +14,24 @@ pub enum DefinedValue {
         slot: StackSlot,
         items: Vec<(Type, Offset32)>,
     },
+    List(Vec<(Type, DefinedValue)>),
 }
 
 #[derive(Debug, Clone)]
 pub struct Definition {
+    pub symbol: Symbol,
     pub val_type: Type,
     pub value: DefinedValue,
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
 pub struct Symbol(usize);
+
+impl Default for Symbol {
+    fn default() -> Self {
+        Symbol(0)
+    }
+}
 
 impl From<usize> for Symbol {
     fn from(value: usize) -> Self {
@@ -33,28 +40,20 @@ impl From<usize> for Symbol {
 }
 
 impl Definition {
-    pub fn new(val_type: Type, value: DefinedValue) -> Self {
-        Self { val_type, value }
+    pub fn new(symbol: Symbol, val_type: Type, value: DefinedValue) -> Self {
+        Self {
+            symbol,
+            val_type,
+            value,
+        }
     }
 
     pub fn null() -> Self {
         Self {
+            symbol: Symbol::default(),
             val_type: types::INVALID,
             value: DefinedValue::None,
         }
-    }
-
-    pub fn symbol(&self) -> Symbol {
-        let index = match self.value {
-            DefinedValue::None => 0,
-            DefinedValue::Value(value) => value.index(),
-            DefinedValue::Variable(var) => var.index(),
-            DefinedValue::Data(data_id) => data_id.index(),
-            DefinedValue::Function(func_id) => func_id.index(),
-            DefinedValue::Stack { slot, .. } => slot.index(),
-        };
-
-        Symbol(index)
     }
 
     pub fn bits(&self) -> u32 {
@@ -69,25 +68,5 @@ impl Definition {
 impl Default for Definition {
     fn default() -> Self {
         Self::null()
-    }
-}
-impl From<(Type, Value)> for Definition {
-    fn from(value: (Type, Value)) -> Self {
-        Self::new(value.0, DefinedValue::Value(value.1))
-    }
-}
-impl From<(Type, FuncId)> for Definition {
-    fn from(value: (Type, FuncId)) -> Self {
-        Self::new(value.0, DefinedValue::Function(value.1))
-    }
-}
-impl From<(Type, DataId)> for Definition {
-    fn from(value: (Type, DataId)) -> Self {
-        Self::new(value.0, DefinedValue::Data(value.1))
-    }
-}
-impl From<(Type, Variable)> for Definition {
-    fn from(value: (Type, Variable)) -> Self {
-        Self::new(value.0, DefinedValue::Variable(value.1))
     }
 }

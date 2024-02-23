@@ -67,7 +67,7 @@ fn main_returns_argc() {
 fn builtin_print() {
     let v: Option<i32> = run_test!(
         i32,
-        "(i:main, (s):argv (print argv))",
+        "(i:main (print \"Hello World\"))",
         vec![b"Hello World\0".as_ptr()],
         Vec<*const u8>
     );

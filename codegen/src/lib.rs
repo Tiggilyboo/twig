@@ -53,11 +53,12 @@ pub struct Compiler {
     flags: Flags,
     module: JITModule,
     definitions: HashMap<Symbol, Definition>,
-    definition_count: usize,
-    symbols: HashMap<String, Symbol>,
-    sig_count: u32,
-    debug: bool,
+    named_symbols: HashMap<String, Symbol>,
     pointer_ty: Type,
+    debug: bool,
+    definition_count: usize,
+    symbol_count: usize,
+    user_sig_count: u32,
 }
 
 impl Compiler {
@@ -76,7 +77,7 @@ impl Compiler {
         let mut module = JITModule::new(module_builder);
         let pointer_ty = module.target_config().pointer_type();
 
-        let mut symbols = HashMap::new();
+        let mut named_symbols = HashMap::new();
         let mut definitions = HashMap::new();
 
         // PRINT
@@ -89,20 +90,21 @@ impl Compiler {
                 .map_err(|e| CompileErr::ModuleErr(e))?;
 
             let symbol = Symbol::from(func_id.index());
-            let def = Definition::new(pointer_ty, DefinedValue::Function(func_id));
-            symbols.insert("print".into(), symbol);
+            let def = Definition::new(symbol, pointer_ty, DefinedValue::Function(func_id));
+            named_symbols.insert("print".into(), symbol);
             definitions.insert(symbol, def);
         }
 
         Ok(Self {
             flags,
             module,
-            definition_count: 0,
             definitions,
-            symbols,
-            sig_count: 0,
-            debug: true,
+            named_symbols,
             pointer_ty,
+            debug: true,
+            definition_count: 0,
+            user_sig_count: 0,
+            symbol_count: 0,
         })
     }
 
@@ -131,9 +133,13 @@ impl Compiler {
             .define_data(data_id, &data_desc)
             .map_err(|e| CompileErr::ModuleErr(e))?;
 
-        let def = Definition::new(self.pointer_ty, DefinedValue::Data(data_id));
+        let def = Definition::new(
+            self.create_symbol(),
+            self.pointer_ty,
+            DefinedValue::Data(data_id),
+        );
         if self.try_register_def(&def) {
-            self.register_symbol(identifier, def.symbol())?;
+            self.register_symbol(identifier, def.symbol)?;
         } else {
             return Err(CompileErr::DefinitionExists(def));
         }
@@ -142,7 +148,7 @@ impl Compiler {
     }
 
     fn get_def_by_name(&self, name: &str) -> Option<&Definition> {
-        if let Some(index) = self.symbols.get(name) {
+        if let Some(index) = self.named_symbols.get(name) {
             if let Some(def) = self.definitions.get(index) {
                 println!("found {name} def: {def:?}");
                 return Some(def);
@@ -154,21 +160,22 @@ impl Compiler {
 
     fn try_register_def(&mut self, def: &Definition) -> bool {
         println!("registered: {def:?}");
-        return self.definitions.insert(def.symbol(), def.clone()).is_none();
+        return self.definitions.insert(def.symbol, def.clone()).is_none();
     }
 
     fn register_symbol(&mut self, name: &str, symbol: Symbol) -> Result<(), CompileErr> {
-        if self.symbols.contains_key(name) {
+        println!("registering {name} = {symbol:?}");
+        if self.named_symbols.contains_key(name) {
             Err(CompileErr::IdentifierExists(name.into()))
         } else {
-            self.symbols.insert(name.to_string(), symbol);
+            self.named_symbols.insert(name.to_string(), symbol);
 
             Ok(())
         }
     }
 
     fn is_defined(&self, name: &str) -> bool {
-        self.symbols.contains_key(name)
+        self.named_symbols.contains_key(name)
     }
 
     fn get_next_def_count(&mut self) -> usize {
@@ -178,9 +185,15 @@ impl Compiler {
     }
 
     fn get_next_sig_count(&mut self) -> u32 {
-        let sig_count = self.sig_count;
-        self.sig_count += 1;
+        let sig_count = self.user_sig_count;
+        self.user_sig_count += 1;
         sig_count
+    }
+
+    fn create_symbol(&mut self) -> Symbol {
+        let symbol_count = self.symbol_count;
+        self.symbol_count += 1;
+        Symbol::from(symbol_count)
     }
 
     fn return_type_to_ir(&self, ret_type: &ReturnType) -> Type {
@@ -205,11 +218,8 @@ impl Compiler {
 
         match value {
             Expr::Identifier(identifier) => {
-                let ident_def = self.get_def_by_name(&identifier.name).cloned();
-
-                if let Some(ident_def) = ident_def {
-                    self.register_symbol(&identifier.name, ident_def.symbol())?;
-                    Ok(ident_def)
+                if let Some(ident_def) = self.get_def_by_name(&identifier.name) {
+                    Ok(ident_def.clone())
                 } else {
                     return Err(CompileErr::UndefinedIdentifier(identifier.name.clone()));
                 }
@@ -220,9 +230,10 @@ impl Compiler {
                 builder.declare_var(var, var_val.0);
                 builder.def_var(var, var_val.1);
 
-                let def = Definition::new(var_val.0, DefinedValue::Variable(var));
+                let symbol = self.create_symbol();
+                let def = Definition::new(symbol, var_val.0, DefinedValue::Variable(var));
                 self.try_register_def(&def);
-                self.register_symbol(name, def.symbol())?;
+                self.register_symbol(name, symbol)?;
 
                 Ok(def)
             }
@@ -292,10 +303,11 @@ impl Compiler {
             for p in params {
                 let ir_ty = self.return_type_to_ir(&p.ty);
                 let param_val = builder.append_block_param(entry_block, ir_ty);
-                let param_def = Definition::new(ir_ty, DefinedValue::Value(param_val));
+                let symbol = self.create_symbol();
+                let param_def = Definition::new(symbol, ir_ty, DefinedValue::Value(param_val));
 
                 self.try_register_def(&param_def);
-                self.register_symbol(&p.identifier.name, param_def.symbol())?;
+                self.register_symbol(&p.identifier.name, param_def.symbol)?;
             }
 
             builder.switch_to_block(entry_block);
@@ -303,13 +315,13 @@ impl Compiler {
 
             res = self.codegen_func(&mut builder, body)?;
             self.try_register_def(&res);
-            self.register_symbol(name, res.symbol())?;
+            self.register_symbol(name, res.symbol)?;
 
             // Determine how to return the function result
             if res.val_type.is_invalid() {
                 builder.ins().return_(&[]);
             } else {
-                let resolved_values = self.resolve_values(&mut builder, &body, &res)?;
+                let resolved_values = self.resolve_definitions(&mut builder, &body, &res)?;
 
                 if returns.len() != resolved_values.len() {
                     return Err(CompileErr::TypeMismatch(format!(
@@ -350,32 +362,52 @@ impl Compiler {
         &mut self,
         builder: &mut FunctionBuilder,
         expr: &Expr,
-        defined: &Definition,
-        stack_index: Option<usize>,
+        defined_type: Type,
+        defined_value: &DefinedValue,
+        index: Option<usize>,
     ) -> Result<Option<(Type, Value)>, CompileErr> {
-        match &defined.value {
+        match defined_value {
             DefinedValue::None => Ok(None),
-            DefinedValue::Value(value) => Ok(Some((defined.val_type, *value))),
+            DefinedValue::Value(value) => Ok(Some((defined_type, *value))),
             DefinedValue::Variable(var) => builder
                 .try_use_var(*var)
-                .map(|v| Some((defined.val_type, v)))
+                .map(|v| Some((defined_type, v)))
                 .map_err(|e| CompileErr::VariableErr(e.to_string())),
             DefinedValue::Data(data_id) => {
                 let pointer = self.pointer_ty;
                 let data = self.module.declare_data_in_func(*data_id, builder.func);
                 let value = builder.ins().global_value(pointer, data);
-                Ok(Some((defined.val_type, value)))
+                Ok(Some((defined_type, value)))
             }
             DefinedValue::Function(func_id) => {
                 let pointer = self.pointer_ty;
                 let func_ref = self.module.declare_func_in_func(*func_id, builder.func);
                 let value = builder.ins().func_addr(pointer, func_ref);
-                Ok(Some((defined.val_type, value)))
+                Ok(Some((defined_type, value)))
+            }
+            DefinedValue::List(defined_values) => {
+                if let Some(list_index) = index {
+                    if let Some(item) = defined_values.get(list_index) {
+                        self.resolve_value(builder, expr, item.0, &item.1, None)
+                    } else {
+                        Err(CompileErr::IndexOutOfRange(format!(
+                            "Unable to find index {list_index} in {expr:?}"
+                        )))
+                    }
+                } else {
+                    // No actual pointer to data for this defined type, store it as a stack and return that pointer
+                    // replace symbol definition
+                    // ??????????
+
+                    Err(CompileErr::IndexOutOfRange(format!(
+                        "{expr:?} requires index to find value in {defined_value:?}"
+                    )))
+                }
             }
             DefinedValue::Stack { slot, items } => {
                 let pointer = self.pointer_ty;
 
-                if let Some(stack_index) = stack_index {
+                if let Some(stack_index) = index {
                     if let Some(item) = items.get(stack_index) {
                         let stack_value = builder.ins().stack_load(item.0, *slot, item.1);
                         Ok(Some((item.0, stack_value)))
@@ -385,13 +417,23 @@ impl Compiler {
                 } else {
                     // Resolve to ref if no stack index given
                     let stack_ref = builder.ins().stack_addr(pointer, *slot, Offset32::new(0));
-                    Ok(Some((defined.val_type, stack_ref)))
+                    Ok(Some((self.pointer_ty, stack_ref)))
                 }
             }
         }
     }
 
-    fn resolve_values(
+    fn resolve_definition(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        expr: &Expr,
+        defined: &Definition,
+        index: Option<usize>,
+    ) -> Result<Option<(Type, Value)>, CompileErr> {
+        self.resolve_value(builder, expr, defined.val_type, &defined.value, index)
+    }
+
+    fn resolve_definitions(
         &mut self,
         builder: &mut FunctionBuilder,
         expr: &Expr,
@@ -406,7 +448,7 @@ impl Compiler {
                 }
             }
             _ => {
-                if let Some(v) = self.resolve_value(builder, expr, defined, None)? {
+                if let Some(v) = self.resolve_definition(builder, expr, defined, None)? {
                     values.push(v);
                 }
             }
@@ -426,7 +468,7 @@ impl Compiler {
         let mut accumulator_type: Option<Type> = None;
 
         for defined_op in operands.iter() {
-            let op_res = self.resolve_values(builder, expr, &defined_op)?;
+            let op_res = self.resolve_definitions(builder, expr, &defined_op)?;
             for pair in op_res {
                 accumulator_values.push(pair);
             }
@@ -473,7 +515,11 @@ impl Compiler {
             )));
         }
 
-        Ok(Definition::from((accumulator_type, accumulator)))
+        Ok(Definition::new(
+            self.create_symbol(),
+            accumulator_type,
+            DefinedValue::Value(accumulator),
+        ))
     }
 
     fn codegen_func_vec(
@@ -505,8 +551,12 @@ impl Compiler {
                 }
             }
             Expr::Number(numeric) => {
-                if let Some(value) = numeric_to_value(builder, numeric) {
-                    Ok(Definition::from(value))
+                if let Some((value_ty, value)) = numeric_to_value(builder, numeric) {
+                    Ok(Definition::new(
+                        self.create_symbol(),
+                        value_ty,
+                        DefinedValue::Value(value),
+                    ))
                 } else {
                     Err(CompileErr::Err(format!(
                         "Unable to convert numeric to value: {numeric:?}"
@@ -515,7 +565,7 @@ impl Compiler {
             }
             Expr::Switch((), (), switch_expr, cases, ()) => {
                 let cond_def = self.codegen_func(builder, switch_expr.as_ref())?;
-                let cond_val = self.resolve_value(builder, switch_expr, &cond_def, None)?;
+                let cond_val = self.resolve_definition(builder, switch_expr, &cond_def, None)?;
                 if cond_val.is_none() {
                     return Err(CompileErr::InvalidCondition(format!(
                         "Switch subject not defined: {switch_expr:?}"
@@ -549,7 +599,7 @@ impl Compiler {
 
                             let else_def = self.codegen_func(builder, default_expr)?;
                             let else_val =
-                                self.resolve_value(builder, default_expr, &else_def, None)?;
+                                self.resolve_definition(builder, default_expr, &else_def, None)?;
                             let merge_block_inputs = if let Some((_, else_value)) = else_val {
                                 vec![else_value]
                             } else {
@@ -594,7 +644,7 @@ impl Compiler {
 
                         let case_def = self.codegen_func(builder, &case_expr)?;
                         let case_value =
-                            self.resolve_value(builder, &case_expr, &case_def, None)?;
+                            self.resolve_definition(builder, &case_expr, &case_def, None)?;
                         let merge_block_inputs = if let Some((_case_ty, case_value)) = case_value {
                             vec![case_value]
                         } else {
@@ -610,7 +660,9 @@ impl Compiler {
                 builder.seal_block(merge_block);
 
                 let switch_value = builder.block_params(merge_block)[0];
-                let switch_def = Definition::new(cond_ty, DefinedValue::Value(switch_value));
+                let symbol = self.create_symbol();
+                let switch_def =
+                    Definition::new(symbol, cond_ty, DefinedValue::Value(switch_value));
 
                 Ok(switch_def)
             }
@@ -622,7 +674,7 @@ impl Compiler {
                 let func_data_id = if let Some(first_item) = items.first() {
                     match first_item {
                         Expr::Identifier(Identifier { name }) => {
-                            if let Some(def_symbol) = self.symbols.get(name) {
+                            if let Some(def_symbol) = self.named_symbols.get(name) {
                                 if let Some(def) = self.definitions.get(def_symbol) {
                                     match def.value {
                                         DefinedValue::Function(func_id) => {
@@ -695,7 +747,7 @@ impl Compiler {
 
                                 // Try to resolve the definition of the parameter
                                 if let Some(param_expr) = items.get(index) {
-                                    let resolved_value = self.resolve_value(builder, param_expr, item_definition, None)
+                                    let resolved_value = self.resolve_definition(builder, param_expr, item_definition, None)
                                         .map_err(|e| CompileErr::InvalidFunctionSignature(format!("function {func_name} parameter {index} from {param_expr:?}: {e:?}")))?;
 
                                     if let Some((_param_type, param_value)) = resolved_value {
@@ -723,15 +775,20 @@ impl Compiler {
                         if call_ret.is_empty() {
                             return Ok(Definition::null());
                         } else {
-                            let mut ret_definitions = Vec::new();
-                            for (ret_val, ret_param) in call_ret.iter().zip(func_ret) {
-                                ret_definitions.push(Definition::new(
-                                    ret_param.clone(),
-                                    DefinedValue::Value(ret_val.clone()),
-                                ));
+                            if call_ret.len() != func_ret.len() {
+                                return Err(CompileErr::TypeMismatch(format!("{func_name} expected return types: {func_ret:?}, got {call_ret:?}")));
                             }
+                            let ret_def_values: Vec<(Type, DefinedValue)> = call_ret
+                                .iter()
+                                .enumerate()
+                                .map(|(i, v)| (func_ret[i], DefinedValue::Value(*v)))
+                                .collect();
 
-                            self.codegen_stack(builder, expr, ret_definitions.iter().collect())
+                            Ok(Definition::new(
+                                self.create_symbol(),
+                                self.pointer_ty,
+                                DefinedValue::List(ret_def_values),
+                            ))
                         }
                     }
                     Some(FuncOrDataId::Data(data_id)) => {
@@ -761,7 +818,7 @@ impl Compiler {
     ) -> Result<Value, CompileErr> {
         let mut operand_ir = Vec::new();
         for operand in operands {
-            if let Some(pair) = self.resolve_value(builder, expr, &operand, None)? {
+            if let Some(pair) = self.resolve_definition(builder, expr, &operand, None)? {
                 operand_ir.push(pair);
             }
         }
@@ -810,7 +867,9 @@ impl Compiler {
         // Resolve all values before defining the stack
         let mut stack_values = Vec::new();
         for item in stack_items {
-            if let Some((item_ty, item_value)) = self.resolve_value(builder, expr, &item, None)? {
+            if let Some((item_ty, item_value)) =
+                self.resolve_definition(builder, expr, &item, None)?
+            {
                 stack_values.push((item_ty, item_value));
             } else {
                 return Err(CompileErr::UndefinedValue(item.clone()));
@@ -837,6 +896,7 @@ impl Compiler {
         }
 
         let def = Definition::new(
+            self.create_symbol(),
             self.pointer_ty,
             DefinedValue::Stack {
                 slot,
